@@ -213,6 +213,33 @@ EXPORT_PER_CPU_SYMBOL(_numa_mem_);
 
 static DEFINE_MUTEX(pcpu_drain_mutex);
 
+#ifdef CONFIG_DEBUG_PAGE_ALLOC_TRACE
+static void dbg_trace_page_alloc(struct page *page, unsigned int order,
+				 gfp_t gfp_flags, const char *func)
+{
+	if (!page)
+		return;
+
+	pr_info("PAGE_ALLOC: %s page=%p pfn=%lu order=%u gfp=0x%x\n",
+		func, page, page_to_pfn(page), order, gfp_flags);
+}
+
+static void dbg_trace_page_free(struct page *page, unsigned int order,
+				const char *func)
+{
+	if (!page)
+		return;
+
+	pr_info("PAGE_FREE: %s page=%p pfn=%lu order=%u\n",
+		func, page, page_to_pfn(page), order);
+}
+#else
+static inline void dbg_trace_page_alloc(struct page *page, unsigned int order,
+					gfp_t gfp_flags, const char *func) { }
+static inline void dbg_trace_page_free(struct page *page, unsigned int order,
+				       const char *func) { }
+#endif
+
 #ifdef CONFIG_GCC_PLUGIN_LATENT_ENTROPY
 volatile unsigned long latent_entropy __latent_entropy;
 EXPORT_SYMBOL(latent_entropy);
@@ -5269,6 +5296,8 @@ out:
 		page = NULL;
 	}
 
+	dbg_trace_page_alloc(page, order, alloc_gfp, __func__);
+
 	trace_mm_page_alloc(page, order, alloc_gfp, ac.migratetype);
 	kmsan_alloc_page(page, order, alloc_gfp);
 
@@ -5322,6 +5351,8 @@ EXPORT_SYMBOL(get_zeroed_page_noprof);
 static void ___free_pages(struct page *page, unsigned int order,
 			  fpi_t fpi_flags)
 {
+	dbg_trace_page_free(page, order, __func__);
+
 	/* get PageHead before we drop reference */
 	int head = PageHead(page);
 	/* get alloc tag in case the page is released by others */
