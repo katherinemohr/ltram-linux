@@ -10,6 +10,7 @@
 #include <linux/bitops.h>
 #include <linux/log2.h>
 #include <linux/node.h>
+#include <linux/node_private.h>
 #include <linux/io.h>
 #include <linux/range.h>
 
@@ -586,6 +587,38 @@ struct cxl_dax_region {
 };
 
 /**
+ * struct cxl_sysram - CXL SysRAM region for system memory hotplug
+ * @dev: device for this sysram
+ * @cxlr: parent cxl_region
+ * @online_type: Default memory online type for new hotplug ops (MMOP_* value)
+ * @last_hotplug_cmd: Last hotplug command submitted (MMOP_* value)
+ * @hpa_range: Host physical address range for the region
+ * @res_name: Resource name for the memory region
+ * @res: Memory resource (set when hotplugged)
+ * @mgid: Memory group id
+ * @mtype: Memory tier type
+ * @numa_node: NUMA node for this memory
+ * @private: true if this region uses N_MEMORY_PRIVATE hotplug
+ * @np: private node registration state (valid when @private is true)
+ *
+ * Device that directly performs memory hotplug for CXL RAM regions.
+ */
+struct cxl_sysram {
+	struct device dev;
+	struct cxl_region *cxlr;
+	enum mmop online_type;
+	int last_hotplug_cmd;
+	struct range hpa_range;
+	const char *res_name;
+	struct resource *res;
+	int mgid;
+	struct memory_dev_type *mtype;
+	int numa_node;
+	bool private;
+	struct node_private np;
+};
+
+/**
  * struct cxl_port - logical collection of upstream port devices and
  *		     downstream port devices to construct a CXL memory
  *		     decode hierarchy.
@@ -785,6 +818,7 @@ static inline void cxl_dport_init_ras_reporting(struct cxl_dport *dport,
 #endif
 
 struct cxl_decoder *to_cxl_decoder(struct device *dev);
+DEFINE_FREE(put_cxl_sysram, struct cxl_sysram *, if (!IS_ERR_OR_NULL(_T)) put_device(&_T->dev))
 struct cxl_root_decoder *to_cxl_root_decoder(struct device *dev);
 struct cxl_switch_decoder *to_cxl_switch_decoder(struct device *dev);
 struct cxl_endpoint_decoder *to_cxl_endpoint_decoder(struct device *dev);
@@ -867,6 +901,7 @@ struct cxl_nvdimm_bridge *to_cxl_nvdimm_bridge(struct device *dev);
 struct cxl_nvdimm_bridge *devm_cxl_add_nvdimm_bridge(struct device *host,
 						     struct cxl_port *port);
 struct cxl_nvdimm *to_cxl_nvdimm(struct device *dev);
+struct cxl_sysram *cxl_region_find_sysram(struct cxl_region *cxlr);
 bool is_cxl_nvdimm(struct device *dev);
 int devm_cxl_add_nvdimm(struct cxl_port *parent_port, struct cxl_memdev *cxlmd);
 struct cxl_nvdimm_bridge *cxl_find_nvdimm_bridge(struct cxl_port *port);
@@ -914,6 +949,7 @@ void cxl_memdev_update_perf(struct cxl_memdev *cxlmd);
 
 void cxl_coordinates_combine(struct access_coordinate *out,
 			     struct access_coordinate *c1,
+#define CXL_DEVICE_SYSRAM		10
 			     struct access_coordinate *c2);
 
 bool cxl_endpoint_decoder_reset_detected(struct cxl_port *port);
@@ -932,6 +968,10 @@ struct cxl_dport *__devm_cxl_add_dport_by_dev(struct cxl_port *port,
 
 u16 cxl_gpf_get_dvsec(struct device *dev);
 
+struct cxl_sysram *to_cxl_sysram(struct device *dev);
+struct device *cxl_sysram_dev(struct cxl_sysram *sysram);
+int devm_cxl_add_sysram(struct cxl_region *cxlr, bool private, enum mmop online_type);
+int cxl_sysram_offline_and_remove(struct cxl_sysram *sysram);
 /*
  * Declaration for functions that are mocked by cxl_test that are called by
  * cxl_core. The respective functions are defined as __foo() and called by
@@ -949,3 +989,16 @@ u16 cxl_gpf_get_dvsec(struct device *dev);
 #endif
 
 #endif /* __CXL_H__ */
+static inline struct cxl_sysram *to_cxl_sysram(struct device *dev)
+{
+	return NULL;
+}
+static inline int devm_cxl_add_sysram(struct cxl_region *cxlr, bool private,
+				      enum mmop online_type)
+{
+	return -ENXIO;
+}
+static inline int cxl_sysram_offline_and_remove(struct cxl_sysram *sysram)
+{
+	return -ENXIO;
+}

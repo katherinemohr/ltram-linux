@@ -1,0 +1,21 @@
+--- mm/huge_memory.c
++++ mm/huge_memory.c
+@@ -3851,7 +3852,7 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n
+ 
+ 			next = folio_next(new_folio);
+ 
+-			zone_device_private_split_cb(folio, new_folio);
++			folio_managed_split_cb(folio, new_folio);
+ 
+ 			folio_ref_unfreeze(new_folio,
+ 					   folio_cache_ref_count(new_folio) + 1);
+@@ -3890,7 +3891,8 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n
+ 			folio_put_refs(new_folio, nr_pages);
+ 		}
+ 
+-		zone_device_private_split_cb(folio, NULL);
++		folio_managed_split_cb(folio, NULL);
++
+ 		/*
+ 		 * Unfreeze @folio only after all page cache entries, which
+ 		 * used to point to it, have been updated with new folios.

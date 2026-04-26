@@ -58,6 +58,7 @@
 #include <linux/random.h>
 #include <linux/mmu_notifier.h>
 #include <linux/parser.h>
+#include <linux/node_private.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -71,6 +72,13 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
+
+static inline bool zone_reclaim_allowed(struct zone *zone, gfp_t gfp_mask)
+{
+	if (node_state(zone_to_nid(zone), N_MEMORY_PRIVATE))
+		return zone_private_flags(zone, NP_OPS_RECLAIM);
+	return cpuset_zone_allowed(zone, gfp_mask);
+}
 
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
@@ -353,6 +361,10 @@ static bool can_demote(int nid, struct scan_control *sc,
 
 	demotion_nid = next_demotion_node(nid);
 	if (demotion_nid == NUMA_NO_NODE)
+		return false;
+
+	/* Don't demote when the target's service signals backpressure */
+	if (node_private_migration_blocked(demotion_nid))
 		return false;
 
 	/* If demotion node isn't in the cgroup's mems_allowed, fall back */
@@ -1045,8 +1057,10 @@ static unsigned int demote_folio_list(struct list_head *demote_folios,
 				     struct pglist_data *pgdat)
 {
 	int target_nid = next_demotion_node(pgdat->node_id);
-	unsigned int nr_succeeded;
+	int first_nid = target_nid;
+	unsigned int nr_succeeded = 0;
 	nodemask_t allowed_mask;
+	int ret;
 
 	struct migration_target_control mtc = {
 		/*
@@ -1068,6 +1082,27 @@ static unsigned int demote_folio_list(struct list_head *demote_folios,
 		return 0;
 
 	node_get_allowed_targets(pgdat, &allowed_mask);
+
+	/* Try private node targets until we find non-private node */
+	while (node_state(target_nid, N_MEMORY_PRIVATE)) {
+		unsigned int nr = 0;
+
+		ret = node_private_migrate_to(demote_folios, target_nid,
+					      MIGRATE_ASYNC, MR_DEMOTION,
+					      &nr);
+		nr_succeeded += nr;
+		if (ret == 0 || list_empty(demote_folios))
+			return nr_succeeded;
+
+		target_nid = next_node_in(target_nid, allowed_mask);
+		if (target_nid == first_nid)
+			return nr_succeeded;
+		if (!node_state(target_nid, N_MEMORY_PRIVATE))
+			break;
+	}
+
+	/* target_nid is a non-private node; use standard migration */
+	mtc.nid = target_nid;
 
 	/* Demotion ignores all cpuset and mempolicy settings */
 	migrate_pages(demote_folios, alloc_demote_folio, NULL,
@@ -6285,7 +6320,7 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 		 * to global LRU.
 		 */
 		if (!cgroup_reclaim(sc)) {
-			if (!cpuset_zone_allowed(zone,
+			if (!zone_reclaim_allowed(zone,
 						 GFP_KERNEL | __GFP_HARDWALL))
 				continue;
 
@@ -7004,6 +7039,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 	unsigned long zone_boosts[MAX_NR_ZONES] = { 0, };
 	bool boosted;
 	struct zone *zone;
+	struct node_reclaim_policy policy;
 	struct scan_control sc = {
 		.gfp_mask = GFP_KERNEL,
 		.order = order,
@@ -7027,6 +7063,9 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 		zone_boosts[i] = zone->watermark_boost;
 	}
 	boosted = nr_boost_reclaim;
+
+	/* Query/cache private node reclaim policy once per balance() */
+	node_private_reclaim_policy(pgdat->node_id, &policy);
 
 restart:
 	set_reclaim_active(pgdat, highest_zoneidx);
@@ -7094,6 +7133,12 @@ restart:
 		 */
 		sc.may_writepage = !laptop_mode && !nr_boost_reclaim;
 		sc.may_swap = !nr_boost_reclaim;
+
+		/* Private nodes may enable swap/writepage when using boost */
+		if (policy.active) {
+			sc.may_swap |= policy.may_swap;
+			sc.may_writepage |= policy.may_writepage;
+		}
 
 		/*
 		 * Do some background aging, to give pages a chance to be
@@ -7181,6 +7226,10 @@ out:
 
 		for (i = 0; i <= highest_zoneidx; i++) {
 			if (!zone_boosts[i])
+				continue;
+
+			/* Some private nodes may own the\ boost lifecycle */
+			if (policy.managed_watermarks)
 				continue;
 
 			/* Increments are under the zone lock */
@@ -7413,7 +7462,7 @@ void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
 	if (!managed_zone(zone))
 		return;
 
-	if (!cpuset_zone_allowed(zone, gfp_flags))
+	if (!zone_reclaim_allowed(zone, gfp_flags))
 		return;
 
 	pgdat = zone->zone_pgdat;
