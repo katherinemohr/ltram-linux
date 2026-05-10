@@ -253,6 +253,7 @@ static int sysctl_lowmem_reserve_ratio[MAX_NR_ZONES] = {
 	[ZONE_HIGHMEM] = 0,
 #endif
 	[ZONE_MOVABLE] = 0,
+	[ZONE_LTRAM] = 0,
 };
 
 char * const zone_names[MAX_NR_ZONES] = {
@@ -3316,6 +3317,9 @@ try_this_zone:
 			 */
 			if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
 				reserve_highatomic_pageblock(page, zone);
+
+			// LTRAM should only ever be allocated explicitly
+			VM_BUG_ON(z == ZONE_LTRAM && !(gfp_mask & __GFP_LTRAM));
 
 			return page;
 		} else {

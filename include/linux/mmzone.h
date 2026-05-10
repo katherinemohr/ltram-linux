@@ -808,8 +808,8 @@ enum zone_type {
 #ifdef CONFIG_ZONE_DEVICE
 	ZONE_DEVICE,
 #endif
+	ZONE_LTRAM,
 	__MAX_NR_ZONES
-
 };
 
 #ifndef __GENERATING_BOUNDS_H
