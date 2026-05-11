@@ -271,6 +271,7 @@ char * const zone_names[MAX_NR_ZONES] = {
 #ifdef CONFIG_ZONE_DEVICE
 	 "Device",
 #endif
+	 "LtRAM",
 };
 
 const char * const migratetype_names[MIGRATE_TYPES] = {
@@ -4537,6 +4538,12 @@ EXPORT_SYMBOL_GPL(__alloc_pages_bulk);
 struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
 							nodemask_t *nodemask)
 {
+	if (unlikely((gfp_mask & GFP_ZONEMASK) == 0x6)) {
+	    /* Use pr_info_ratelimited to prevent log-spam if 0x6 is actually busy */
+	    pr_info_ratelimited("LTRAM_DETECT: Pattern 0x6 used by %s (PID: %d). Flags: 0x%lx\n",
+	                       current->comm, current->pid, (unsigned long)gfp_mask);
+	}
+
 	struct page *page;
 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
 	gfp_t alloc_gfp; /* The gfp_t that was actually used for allocation */
