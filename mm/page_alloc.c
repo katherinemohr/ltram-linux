@@ -3319,8 +3319,10 @@ try_this_zone:
 			if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
 				reserve_highatomic_pageblock(page, zone);
 
-			// LTRAM should only ever be allocated explicitly
-			VM_BUG_ON(z == ZONE_LTRAM && !(gfp_mask & __GFP_LTRAM));
+			// LTRAM allocations must be explicitly requested and must
+			// only come from the LTRAM zone.
+			VM_BUG_ON((gfp_mask & __GFP_LTRAM) !=
+				 (zone_idx(zone) == ZONE_LTRAM));
 
 			return page;
 		} else {
@@ -4360,6 +4362,11 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
 					ac->highest_zoneidx, ac->nodemask);
 
+	if (gfp_mask & __GFP_LTRAM) {
+		ac->highest_zoneidx = ZONE_LTRAM;
+		ac->zonelist        = node_zonelist(1, gfp_mask);
+	}
+
 	return true;
 }
 
@@ -4538,12 +4545,6 @@ EXPORT_SYMBOL_GPL(__alloc_pages_bulk);
 struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
 							nodemask_t *nodemask)
 {
-	if (unlikely((gfp_mask & GFP_ZONEMASK) == 0x6)) {
-	    /* Use pr_info_ratelimited to prevent log-spam if 0x6 is actually busy */
-	    pr_info_ratelimited("LTRAM_DETECT: Pattern 0x6 used by %s (PID: %d). Flags: 0x%lx\n",
-	                       current->comm, current->pid, (unsigned long)gfp_mask);
-	}
-
 	struct page *page;
 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
 	gfp_t alloc_gfp; /* The gfp_t that was actually used for allocation */
