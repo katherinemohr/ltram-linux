@@ -88,12 +88,17 @@ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
  * GFP_ZONES_SHIFT must be <= 2 on 32 bit platforms.
  */
 
-#if defined(CONFIG_ZONE_DEVICE) && (MAX_NR_ZONES-1) <= 4
+#if defined(CONFIG_ZONE_DEVICE) && (MAX_NR_ZONES-2) <= 4
 /* ZONE_DEVICE is not a valid GFP zone specifier */
+/* xxx(kmohr): I'm also going to make ZONE_LTRAM not part of this table. */
 #define GFP_ZONES_SHIFT 2
 #else
 #define GFP_ZONES_SHIFT ZONES_SHIFT
 #endif
+
+// #if BITS_PER_LONG == 32
+// #error bits per long = 32
+// #endif
 
 #if 16 * GFP_ZONES_SHIFT > BITS_PER_LONG
 #error GFP_ZONES_SHIFT too large to create GFP_ZONE_TABLE integer

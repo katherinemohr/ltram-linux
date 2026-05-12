@@ -1278,6 +1278,35 @@ static void __init calculate_node_totalpages(struct pglist_data *pgdat,
 		unsigned long spanned, absent;
 		unsigned long real_size;
 
+	  	/* LTRAM override: claim all memory on this node for ZONE_LTRAM */
+	        if (pgdat->node_id == 1) {
+	            if (i == ZONE_LTRAM) {
+	                /* Give LTRAM the entire node range */
+	                zone_start_pfn = node_start_pfn;
+	                zone_end_pfn = node_end_pfn;
+	                spanned = node_end_pfn - node_start_pfn;
+	                absent = 0;  // Simplification: assume no holes
+	                real_size = spanned;
+
+	                zone->zone_start_pfn = zone_start_pfn;
+	                zone->spanned_pages = spanned;
+	                zone->present_pages = real_size;
+	                totalpages += spanned;
+	                realtotalpages += real_size;
+
+	                pr_info("Node %d: Assigned %lu pages to ZONE_LTRAM\n",
+	                        pgdat->node_id, real_size);
+	                continue;  // Skip normal calculation
+	            } else {
+	                /* Zero out all other zones on LTRAM nodes */
+	                zone->zone_start_pfn = 0;
+	                zone->spanned_pages = 0;
+	                zone->present_pages = 0;
+	                continue;  // Skip normal calculation and totalpages accounting
+	            }
+	        }
+
+
 		spanned = zone_spanned_pages_in_node(pgdat->node_id, i,
 						     node_start_pfn,
 						     node_end_pfn,
@@ -1732,6 +1761,21 @@ static void __init free_area_init_node(int nid)
 
 	free_area_init_core(pgdat);
 	lru_gen_init_pgdat(pgdat);
+
+	// /* LTRAM zone needs special setup */
+ //        if (nid == 1) {
+ //            struct zone *ltram = &pgdat->node_zones[ZONE_LTRAM];
+
+ //            ltram->name = "LTRAM";
+ //            ltram->zone_pgdat = pgdat;
+ //            ltram->zone_start_pfn = pgdat->node_start_pfn;
+ //            ltram->spanned_pages = pgdat->node_spanned_pages;
+ //            ltram->present_pages = pgdat->node_present_pages;
+
+ //            /* Initialize freelists */
+ //            for (int order = 0; order < MAX_ORDER; order++)
+ //                INIT_LIST_HEAD(&ltram->free_area[order].free_list[MIGRATE_UNMOVABLE]);
+ //        }
 }
 
 /* Any regular or high memory on that node ? */
