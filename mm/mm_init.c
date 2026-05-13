@@ -1601,7 +1601,7 @@ static void __init free_area_init_core(struct pglist_data *pgdat)
 		 * and per-cpu initialisations
 		 */
 		memmap_pages = calc_memmap_size(size, freesize);
-		if (!is_highmem_idx(j)) {
+		if (!is_highmem_idx(j) && j != ZONE_LTRAM) {
 			if (freesize >= memmap_pages) {
 				freesize -= memmap_pages;
 				if (memmap_pages)
@@ -1618,7 +1618,7 @@ static void __init free_area_init_core(struct pglist_data *pgdat)
 			pr_debug("  %s zone: %lu pages reserved\n", zone_names[0], dma_reserve);
 		}
 
-		if (!is_highmem_idx(j))
+		if (!is_highmem_idx(j) && j != ZONE_LTRAM)
 			nr_kernel_pages += freesize;
 		/* Charge for highmem memmap if there are enough kernel pages */
 		else if (nr_kernel_pages > memmap_pages * 2)
@@ -1762,20 +1762,6 @@ static void __init free_area_init_node(int nid)
 	free_area_init_core(pgdat);
 	lru_gen_init_pgdat(pgdat);
 
-	// /* LTRAM zone needs special setup */
- //        if (nid == 1) {
- //            struct zone *ltram = &pgdat->node_zones[ZONE_LTRAM];
-
- //            ltram->name = "LTRAM";
- //            ltram->zone_pgdat = pgdat;
- //            ltram->zone_start_pfn = pgdat->node_start_pfn;
- //            ltram->spanned_pages = pgdat->node_spanned_pages;
- //            ltram->present_pages = pgdat->node_present_pages;
-
- //            /* Initialize freelists */
- //            for (int order = 0; order < MAX_ORDER; order++)
- //                INIT_LIST_HEAD(&ltram->free_area[order].free_list[MIGRATE_UNMOVABLE]);
- //        }
 }
 
 /* Any regular or high memory on that node ? */

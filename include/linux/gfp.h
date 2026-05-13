@@ -135,6 +135,12 @@ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
 static inline enum zone_type gfp_zone(gfp_t flags)
 {
 	enum zone_type z;
+
+	/* Handle LTRAM outside the zone table */
+	if (unlikely(flags & __GFP_LTRAM)) {
+		return ZONE_LTRAM;
+	}
+
 	int bit = (__force int) (flags & GFP_ZONEMASK);
 
 	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &

@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include <linux/init.h>
+#include <linux/mmzone.h>
+#include <linux/mm.h>
+#include <linux/mm_inline.h>
+#include <linux/migrate.h>
+#include <linux/printk.h>
+#include <linux/ltram.h>
+#include "internal.h"
+
+static int __init ltram_init(void)
+{
+	struct zone *zone;
+
+	if (!node_online(1)) {
+		pr_warn("LTRAM: node 1 is not online, no NOR flash memory available\n");
+		return 0;
+	}
+
+	zone = &NODE_DATA(1)->node_zones[ZONE_LTRAM];
+
+	if (!populated_zone(zone)) {
+		pr_warn("LTRAM: ZONE_LTRAM is not populated\n");
+		return 0;
+	}
+
+	/*
+	 * setup_per_zone_wmarks() has already run and assigned non-zero
+	 * watermarks to ZONE_LTRAM, which would cause kswapd to reclaim
+	 * from it like a normal zone. Zero them out so kswapd ignores us.
+	 */
+	spin_lock(&zone->lock);
+	zone->_watermark[WMARK_MIN]   = 0;
+	zone->_watermark[WMARK_LOW]   = 0;
+	zone->_watermark[WMARK_HIGH]  = 0;
+	zone->_watermark[WMARK_PROMO] = 0;
+	zone->watermark_boost         = 0;
+	spin_unlock(&zone->lock);
+
+	pr_info("LTRAM: %lu pages (%lu MiB) available in ZONE_LTRAM on node 1\n",
+		zone_managed_pages(zone),
+		zone_managed_pages(zone) >> (20 - PAGE_SHIFT));
+
+	return 0;
+}
+subsys_initcall(ltram_init);
+
+/**
+ * ltram_migrate_to - migrate a folio from DRAM to ZONE_LTRAM (NOR flash)
+ * @folio: folio to migrate; must be on an LRU list
+ *
+ * Isolates @folio from its LRU, migrates it to a page in ZONE_LTRAM on
+ * node 1, and returns it to the LRU on failure.
+ *
+ * Returns 0 on success, -EBUSY if the folio could not be isolated,
+ * or -EFAULT if migration itself failed.
+ */
+int ltram_migrate_to(struct folio *folio)
+{
+	LIST_HEAD(list);
+	struct migration_target_control mtc = {
+		.nid      = 1,
+		.gfp_mask = GFP_LTRAM,
+	};
+	int err;
+
+	if (!folio_isolate_lru(folio))
+		return -EBUSY;
+
+	node_stat_mod_folio(folio, NR_ISOLATED_ANON + folio_is_file_lru(folio),
+			    folio_nr_pages(folio));
+	list_add_tail(&folio->lru, &list);
+
+	err = migrate_pages(&list, alloc_migration_target, NULL,
+			    (unsigned long)&mtc, MIGRATE_SYNC, MR_SYSCALL, NULL);
+	if (err)
+		putback_movable_pages(&list);
+	return err ? -EFAULT : 0;
+}
+
+/**
+ * ltram_migrate_from - migrate a folio from ZONE_LTRAM back to DRAM
+ * @folio: folio to migrate; must be on an LRU list and in ZONE_LTRAM
+ *
+ * Isolates @folio from its LRU, migrates it to a page in ZONE_NORMAL on
+ * node 0, and returns it to the LRU on failure.
+ *
+ * Returns 0 on success, -EBUSY if the folio could not be isolated,
+ * or -EFAULT if migration itself failed.
+ */
+int ltram_migrate_from(struct folio *folio)
+{
+	LIST_HEAD(list);
+	struct migration_target_control mtc = {
+		.nid      = 0,
+		.gfp_mask = GFP_HIGHUSER_MOVABLE | __GFP_THISNODE,
+	};
+	int err;
+
+	if (!folio_isolate_lru(folio))
+		return -EBUSY;
+
+	node_stat_mod_folio(folio, NR_ISOLATED_ANON + folio_is_file_lru(folio),
+			    folio_nr_pages(folio));
+	list_add_tail(&folio->lru, &list);
+
+	err = migrate_pages(&list, alloc_migration_target, NULL,
+			    (unsigned long)&mtc, MIGRATE_SYNC, MR_SYSCALL, NULL);
+	if (err)
+		putback_movable_pages(&list);
+	return err ? -EFAULT : 0;
+}

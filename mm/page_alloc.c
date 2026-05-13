@@ -4363,8 +4363,10 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 					ac->highest_zoneidx, ac->nodemask);
 
 	if (gfp_mask & __GFP_LTRAM) {
-		ac->highest_zoneidx = ZONE_LTRAM;
-		ac->zonelist        = node_zonelist(1, gfp_mask);
+		ac->highest_zoneidx   = ZONE_LTRAM;
+		ac->zonelist          = node_zonelist(1, gfp_mask);
+		ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
+						ac->highest_zoneidx, ac->nodemask);
 	}
 
 	return true;
@@ -4967,7 +4969,7 @@ static int build_zonerefs_node(pg_data_t *pgdat, struct zoneref *zonerefs)
 	do {
 		zone_type--;
 		zone = pgdat->node_zones + zone_type;
-		if (populated_zone(zone)) {
+		if (populated_zone(zone) && zone_type != ZONE_LTRAM) {
 			zoneref_set_zone(zone, &zonerefs[nr_zones++]);
 			check_highest_zone(zone_type);
 		}
@@ -5850,7 +5852,8 @@ static void __setup_per_zone_wmarks(void)
 
 	/* Calculate total number of !ZONE_HIGHMEM and !ZONE_MOVABLE pages */
 	for_each_zone(zone) {
-		if (!is_highmem(zone) && zone_idx(zone) != ZONE_MOVABLE)
+		if (!is_highmem(zone) && zone_idx(zone) != ZONE_MOVABLE &&
+		    zone_idx(zone) != ZONE_LTRAM)
 			lowmem_pages += zone_managed_pages(zone);
 	}
 

@@ -72,7 +72,7 @@ typedef unsigned int __bitwise gfp_t;
 #define __GFP_DMA32	((__force gfp_t)___GFP_DMA32)
 #define __GFP_MOVABLE	((__force gfp_t)___GFP_MOVABLE)  /* ZONE_MOVABLE allowed */
 #define __GFP_LTRAM	((__force gfp_t)___GFP_LTRAM)
-/* XXX(kmohr): not including LtRAM below to keep this at 4 bits, not sure if this is correct... */
+/* XXX(kmohr): not including LtRAM below to keep this at 4 bits */
 #define GFP_ZONEMASK	(__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE)
 
 /**

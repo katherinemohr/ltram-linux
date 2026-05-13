@@ -15,7 +15,6 @@
 
 #define gfpflag_string(flag) {(__force unsigned long)flag, #flag}
 
-// TODO(kmohr): LtRAM string?
 #define __def_gfpflag_names			\
 	gfpflag_string(GFP_TRANSHUGE),		\
 	gfpflag_string(GFP_TRANSHUGE_LIGHT),	\
@@ -40,6 +39,7 @@
 	gfpflag_string(__GFP_NORETRY),		\
 	gfpflag_string(__GFP_COMP),		\
 	gfpflag_string(__GFP_ZERO),		\
+	gfpflag_string(__GFP_LTRAM),		\
 	gfpflag_string(__GFP_NOMEMALLOC),	\
 	gfpflag_string(__GFP_MEMALLOC),		\
 	gfpflag_string(__GFP_HARDWALL),		\
