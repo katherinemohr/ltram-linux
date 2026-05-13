@@ -29,6 +29,7 @@
 #include <linux/crash_dump.h>
 #include "internal.h"
 #include "slab.h"
+#include <linux/ltram.h>
 #include "shuffle.h"
 
 #include <asm/setup.h>
@@ -1278,45 +1279,32 @@ static void __init calculate_node_totalpages(struct pglist_data *pgdat,
 		unsigned long spanned, absent;
 		unsigned long real_size;
 
-	  	/* LTRAM override: claim all memory on this node for ZONE_LTRAM */
-	        if (pgdat->node_id == 1) {
-	            if (i == ZONE_LTRAM) {
-	                /* Give LTRAM the entire node range */
-	                zone_start_pfn = node_start_pfn;
-	                zone_end_pfn = node_end_pfn;
-	                spanned = node_end_pfn - node_start_pfn;
-	                absent = 0;  // Simplification: assume no holes
-	                real_size = spanned;
-
-	                zone->zone_start_pfn = zone_start_pfn;
-	                zone->spanned_pages = spanned;
-	                zone->present_pages = real_size;
-	                totalpages += spanned;
-	                realtotalpages += real_size;
-
-	                pr_info("Node %d: Assigned %lu pages to ZONE_LTRAM\n",
-	                        pgdat->node_id, real_size);
-	                continue;  // Skip normal calculation
-	            } else {
-	                /* Zero out all other zones on LTRAM nodes */
-	                zone->zone_start_pfn = 0;
-	                zone->spanned_pages = 0;
-	                zone->present_pages = 0;
-	                continue;  // Skip normal calculation and totalpages accounting
-	            }
-	        }
-
-
-		spanned = zone_spanned_pages_in_node(pgdat->node_id, i,
-						     node_start_pfn,
-						     node_end_pfn,
-						     &zone_start_pfn,
-						     &zone_end_pfn);
-		absent = zone_absent_pages_in_node(pgdat->node_id, i,
-						   zone_start_pfn,
-						   zone_end_pfn);
-
-		real_size = spanned - absent;
+		/*
+		 * LTRAM override: node LTRAM_NUMA_NODE is dedicated entirely to
+		 * ZONE_LTRAM. Give that zone the full node range; zero all others.
+		 * NOR flash memory is contiguous, so absent = 0.
+		 */
+		if (pgdat->node_id == LTRAM_NUMA_NODE) {
+			if (i == ZONE_LTRAM) {
+				zone_start_pfn = node_start_pfn;
+				spanned        = node_end_pfn - node_start_pfn;
+			} else {
+				zone_start_pfn = 0;
+				spanned        = 0;
+			}
+			absent    = 0;
+			real_size = spanned;
+		} else {
+			spanned = zone_spanned_pages_in_node(pgdat->node_id, i,
+							     node_start_pfn,
+							     node_end_pfn,
+							     &zone_start_pfn,
+							     &zone_end_pfn);
+			absent    = zone_absent_pages_in_node(pgdat->node_id, i,
+							      zone_start_pfn,
+							      zone_end_pfn);
+			real_size = spanned - absent;
+		}
 
 		if (spanned)
 			zone->zone_start_pfn = zone_start_pfn;

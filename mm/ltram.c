@@ -12,12 +12,13 @@ static int __init ltram_init(void)
 {
 	struct zone *zone;
 
-	if (!node_online(1)) {
-		pr_warn("LTRAM: node 1 is not online, no NOR flash memory available\n");
+	if (!node_online(LTRAM_NUMA_NODE)) {
+		pr_warn("LTRAM: node %d is not online, no NOR flash memory available\n",
+			LTRAM_NUMA_NODE);
 		return 0;
 	}
 
-	zone = &NODE_DATA(1)->node_zones[ZONE_LTRAM];
+	zone = &NODE_DATA(LTRAM_NUMA_NODE)->node_zones[ZONE_LTRAM];
 
 	if (!populated_zone(zone)) {
 		pr_warn("LTRAM: ZONE_LTRAM is not populated\n");
@@ -59,7 +60,7 @@ int ltram_migrate_to(struct folio *folio)
 {
 	LIST_HEAD(list);
 	struct migration_target_control mtc = {
-		.nid      = 1,
+		.nid      = LTRAM_NUMA_NODE,
 		.gfp_mask = GFP_LTRAM,
 	};
 	int err;
@@ -92,7 +93,7 @@ int ltram_migrate_from(struct folio *folio)
 {
 	LIST_HEAD(list);
 	struct migration_target_control mtc = {
-		.nid      = 0,
+		.nid      = 0,  /* DRAM node */
 		.gfp_mask = GFP_HIGHUSER_MOVABLE | __GFP_THISNODE,
 	};
 	int err;

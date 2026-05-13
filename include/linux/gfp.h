@@ -96,10 +96,6 @@ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
 #define GFP_ZONES_SHIFT ZONES_SHIFT
 #endif
 
-// #if BITS_PER_LONG == 32
-// #error bits per long = 32
-// #endif
-
 #if 16 * GFP_ZONES_SHIFT > BITS_PER_LONG
 #error GFP_ZONES_SHIFT too large to create GFP_ZONE_TABLE integer
 #endif
