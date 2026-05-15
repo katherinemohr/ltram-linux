@@ -2,6 +2,7 @@
 /* Common code for 32 and 64-bit NUMA */
 #include <linux/acpi.h>
 #include <linux/kernel.h>
+#include <linux/ltram.h>
 #include <linux/mm.h>
 #include <linux/of.h>
 #include <linux/string.h>
@@ -205,8 +206,12 @@ static void __init alloc_node_data(int nid)
 	/*
 	 * Allocate node data.  Try node-local memory and then any node.
 	 * Never allocate in DMA zone.
+	 *
+	 * For the LTRAM node, force allocation on node 0 — LTRAM pages must
+	 * not be consumed without an explicit GFP_LTRAM request.
 	 */
-	nd_pa = memblock_phys_alloc_try_nid(nd_size, SMP_CACHE_BYTES, nid);
+	nd_pa = memblock_phys_alloc_try_nid(nd_size, SMP_CACHE_BYTES,
+					    nid == LTRAM_NUMA_NODE ? 0 : nid);
 	if (!nd_pa) {
 		pr_err("Cannot find %zu bytes in any node (initial node: %d)\n",
 		       nd_size, nid);

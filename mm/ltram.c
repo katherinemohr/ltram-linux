@@ -4,6 +4,7 @@
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
 #include <linux/migrate.h>
+#include <linux/nodemask.h>
 #include <linux/printk.h>
 #include <linux/ltram.h>
 #include "internal.h"
@@ -26,17 +27,18 @@ static int __init ltram_init(void)
 	}
 
 	/*
-	 * setup_per_zone_wmarks() has already run and assigned non-zero
-	 * watermarks to ZONE_LTRAM, which would cause kswapd to reclaim
-	 * from it like a normal zone. Zero them out so kswapd ignores us.
+	 * Remove the LTRAM node from N_MEMORY and N_NORMAL_MEMORY so that
+	 * kswapd, kcompactd, shrink_node(), and other per-N_MEMORY-node
+	 * subsystems never visit it. This runs at subsys_initcall (level 4),
+	 * before kswapd_init() and kcompactd_init() (module_init, level 6),
+	 * so no threads are created for this node.
+	 *
+	 * GFP_LTRAM allocations are unaffected: they bypass node_states
+	 * entirely and hardcode node_zonelist(LTRAM_NUMA_NODE, ...) in
+	 * prepare_alloc_pages().
 	 */
-	spin_lock(&zone->lock);
-	zone->_watermark[WMARK_MIN]   = 0;
-	zone->_watermark[WMARK_LOW]   = 0;
-	zone->_watermark[WMARK_HIGH]  = 0;
-	zone->_watermark[WMARK_PROMO] = 0;
-	zone->watermark_boost         = 0;
-	spin_unlock(&zone->lock);
+	node_clear_state(LTRAM_NUMA_NODE, N_MEMORY);
+	node_clear_state(LTRAM_NUMA_NODE, N_NORMAL_MEMORY);
 
 	pr_info("LTRAM: %lu pages (%lu MiB) available in ZONE_LTRAM on node 1\n",
 		zone_managed_pages(zone),

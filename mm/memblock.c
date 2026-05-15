@@ -1490,10 +1490,10 @@ done:
 	 */
 	{
 		unsigned long _start_pfn, _end_pfn;
-		WARN_ONCE(memblock_search_pfn_nid(PFN_DOWN(found),
-						  &_start_pfn, &_end_pfn) == LTRAM_NUMA_NODE,
-			  "memblock: unexpected allocation on LTRAM node %d at PFN %lu\n",
-			  LTRAM_NUMA_NODE, PFN_DOWN(found));
+		WARN(memblock_search_pfn_nid(PFN_DOWN(found),
+					     &_start_pfn, &_end_pfn) == LTRAM_NUMA_NODE,
+		     "memblock: unexpected allocation on LTRAM node %d at PFN %lu\n",
+		     LTRAM_NUMA_NODE, PFN_DOWN(found));
 	}
 
 	/*
