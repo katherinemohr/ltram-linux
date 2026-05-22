@@ -9,6 +9,11 @@
 #include <linux/ltram.h>
 #include "internal.h"
 
+/*
+ * TODO(kmohr): This needs more exhaustive reviewing, but I'll leave it for now
+ * so this branch can get merged in and not block other work from progressing.
+ */
+
 static int __init ltram_init(void)
 {
 	struct zone *zone;

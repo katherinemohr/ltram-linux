@@ -3197,10 +3197,10 @@ retry:
 				continue;
 		/*
 		 * Refuse to hand out LTRAM pages to callers that didn't ask for
-		 * them. This is defense-in-depth on top of the highest_zoneidx
-		 * filter and the zonelist exclusion in build_zonerefs_node;
-		 * fires unconditionally (not just CONFIG_DEBUG_VM) so boot
-		 * mistakes show up in dmesg.
+		 * them.
+		 * We don't really expect to get here because ZONE_LTRAM is the
+		 * highest zone and because of the zonelist exclusion in
+		 * build_zonerefs_node, but just to be safe.
 		 */
 		if (WARN_ONCE(zone_idx(zone) == ZONE_LTRAM &&
 			      !(gfp_mask & __GFP_LTRAM),
@@ -3331,8 +3331,10 @@ try_this_zone:
 			if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
 				reserve_highatomic_pageblock(page, zone);
 
-			// LTRAM allocations must be explicitly requested and must
-			// only come from the LTRAM zone.
+			/*
+			 * LTRAM allocations must be explicitly requested and must
+			 * only come from the LTRAM zone.
+			 */
 			VM_BUG_ON((gfp_mask & __GFP_LTRAM) !=
 				 (zone_idx(zone) == ZONE_LTRAM));
 
