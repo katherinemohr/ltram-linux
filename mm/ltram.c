@@ -113,3 +113,105 @@ int ltram_migrate_from(struct folio *folio)
 		putback_movable_pages(&list);
 	return err ? -EFAULT : 0;
 }
+
+static int __init ltram_selftest(void)
+{
+	struct zone *zone = &NODE_DATA(LTRAM_NUMA_NODE)->node_zones[ZONE_LTRAM];
+	struct address_space *mapping;
+	struct file *file;
+	struct folio *folio;
+	int ret = 0;
+
+	if (!node_online(LTRAM_NUMA_NODE) || !populated_zone(zone)) {
+		pr_info("LTRAM selftest: ZONE_LTRAM not available, skipping\n");
+		return 0;
+	}
+
+	/* Test 1: GFP_LTRAM allocation lands on the LTRAM node. */
+	folio = folio_alloc(GFP_LTRAM, 0);
+	if (WARN(!folio, "LTRAM selftest: GFP_LTRAM allocation failed\n"))
+		return -ENOMEM;
+	if (WARN(folio_nid(folio) != LTRAM_NUMA_NODE,
+		 "LTRAM selftest: GFP_LTRAM allocated on node %d, expected %d\n",
+		 folio_nid(folio), LTRAM_NUMA_NODE)) {
+		folio_put(folio);
+		return -EINVAL;
+	}
+	folio_put(folio);
+	pr_info("LTRAM selftest: alloc           OK\n");
+
+	/*
+	 * Tests 2 and 3 use a shmem file to obtain a folio with a real
+	 * address_space.  folio_migrate_mapping() checks:
+	 *   folio_ref_freeze(folio, folio_expected_refs(mapping, folio))
+	 * For a single-page shmem folio: expected = 1 + nr_pages = 2.
+	 * The freeze must see exactly pagecache-ref(1) + isolation-ref(1).
+	 * Any extra caller reference makes it 3 and the freeze fails silently.
+	 * We therefore drop our reference before calling ltram_migrate_to/from,
+	 * relying on the page cache to keep the folio alive.
+	 */
+	file = shmem_file_setup("ltram_selftest", PAGE_SIZE, 0);
+	if (WARN(IS_ERR(file), "LTRAM selftest: shmem_file_setup: %ld\n",
+		 PTR_ERR(file)))
+		return PTR_ERR(file);
+	mapping = file->f_mapping;
+
+	/* Test 2: migrate DRAM → LTRAM. */
+	folio = read_mapping_folio(mapping, 0, file);
+	if (WARN(IS_ERR(folio), "LTRAM selftest: read_mapping_folio: %ld\n",
+		 PTR_ERR(folio))) {
+		ret = PTR_ERR(folio);
+		goto out;
+	}
+	folio_unlock(folio);
+	folio_add_lru(folio);
+	lru_add_drain();
+	folio_put(folio); /* drop caller ref; pagecache keeps folio alive */
+
+	ret = ltram_migrate_to(folio); /* folio ptr invalid after this */
+	if (WARN(ret, "LTRAM selftest: migrate_to failed: %d\n", ret))
+		goto out;
+
+	folio = filemap_get_folio(mapping, 0); /* look up new LTRAM folio */
+	if (WARN(IS_ERR(folio),
+		 "LTRAM selftest: folio missing after migrate_to\n")) {
+		ret = PTR_ERR(folio);
+		goto out;
+	}
+	if (WARN(folio_nid(folio) != LTRAM_NUMA_NODE,
+		 "LTRAM selftest: folio on node %d after migrate_to, expected %d\n",
+		 folio_nid(folio), LTRAM_NUMA_NODE)) {
+		folio_put(folio);
+		ret = -EINVAL;
+		goto out;
+	}
+	pr_info("LTRAM selftest: migrate_to      OK\n");
+
+	/* Test 3: migrate LTRAM → DRAM. */
+	folio_put(folio); /* drop filemap_get ref; migration put folio on LRU */
+	lru_add_drain();  /* flush per-CPU LRU batch so isolation sees it */
+
+	ret = ltram_migrate_from(folio); /* folio ptr invalid after this */
+	if (WARN(ret, "LTRAM selftest: migrate_from failed: %d\n", ret))
+		goto out;
+
+	folio = filemap_get_folio(mapping, 0); /* look up new DRAM folio */
+	if (WARN(IS_ERR(folio),
+		 "LTRAM selftest: folio missing after migrate_from\n")) {
+		ret = PTR_ERR(folio);
+		goto out;
+	}
+	if (WARN(folio_nid(folio) == LTRAM_NUMA_NODE,
+		 "LTRAM selftest: folio still on LTRAM node after migrate_from\n")) {
+		folio_put(folio);
+		ret = -EINVAL;
+		goto out;
+	}
+	folio_put(folio);
+	pr_info("LTRAM selftest: migrate_from    OK\n");
+	pr_info("LTRAM selftest: PASS\n");
+out:
+	fput(file);
+	return ret;
+}
+late_initcall(ltram_selftest);
