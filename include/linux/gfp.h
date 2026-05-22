@@ -132,7 +132,12 @@ static inline enum zone_type gfp_zone(gfp_t flags)
 {
 	enum zone_type z;
 
-	/* Handle LTRAM outside the zone table */
+	/* Handle LTRAM outside the zone table since we don't have enough space
+	 * in the zone table for another flag.
+	 * Math: GFP_ZONE_TABLE = # rows * 3 bits per row
+	 * # rows = 2 ^ (zone flags minus 1 for the DEVICE flag)
+	 * (2^4) * 3 = 48 < 64, but (2^5) * 3 = 96 > 64
+	 */
 	if (unlikely(flags & __GFP_LTRAM)) {
 		return ZONE_LTRAM;
 	}

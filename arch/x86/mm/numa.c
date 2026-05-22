@@ -53,9 +53,8 @@ early_param("numa", numa_setup);
 /*
  * apicid, cpu, node mappings
  */
-s16 __apicid_to_node[MAX_LOCAL_APIC] = {
-	[0 ... MAX_LOCAL_APIC-1] = NUMA_NO_NODE
-};
+s16 __apicid_to_node[MAX_LOCAL_APIC] = { [0 ... MAX_LOCAL_APIC - 1] =
+						 NUMA_NO_NODE };
 
 int numa_cpu_node(int cpu)
 {
@@ -207,8 +206,9 @@ static void __init alloc_node_data(int nid)
 	 * Allocate node data.  Try node-local memory and then any node.
 	 * Never allocate in DMA zone.
 	 *
-	 * For the LTRAM node, force allocation on node 0 — LTRAM pages must
-	 * not be consumed without an explicit GFP_LTRAM request.
+	 * It's a little odd not to store the node metadata on the actual node,
+	 * but we need to keep kernel data structures out of LtRAM, so allocate
+	 * node 1's (the LtRAM node) metadata on node 0.
 	 */
 	nd_pa = memblock_phys_alloc_try_nid(nd_size, SMP_CACHE_BYTES,
 					    nid == LTRAM_NUMA_NODE ? 0 : nid);
@@ -253,8 +253,8 @@ int __init numa_cleanup_meminfo(struct numa_meminfo *mi)
 		struct numa_memblk *bi = &mi->blk[i];
 
 		/* move / save reserved memory ranges */
-		if (!memblock_overlaps_region(&memblock.memory,
-					bi->start, bi->end - bi->start)) {
+		if (!memblock_overlaps_region(&memblock.memory, bi->start,
+					      bi->end - bi->start)) {
 			numa_move_tail_memblk(&numa_reserved_meminfo, i--, mi);
 			continue;
 		}
@@ -318,7 +318,8 @@ int __init numa_cleanup_meminfo(struct numa_meminfo *mi)
 			}
 			if (k < mi->nr_blks)
 				continue;
-			printk(KERN_INFO "NUMA: Node %d [mem %#010Lx-%#010Lx] + [mem %#010Lx-%#010Lx] -> [mem %#010Lx-%#010Lx]\n",
+			printk(KERN_INFO
+			       "NUMA: Node %d [mem %#010Lx-%#010Lx] + [mem %#010Lx-%#010Lx] -> [mem %#010Lx-%#010Lx]\n",
 			       bi->nid, bi->start, bi->end - 1, bj->start,
 			       bj->end - 1, start, end - 1);
 			bi->start = start;
@@ -358,13 +359,14 @@ static void __init numa_nodemask_from_meminfo(nodemask_t *nodemask,
  */
 void __init numa_reset_distance(void)
 {
-	size_t size = numa_distance_cnt * numa_distance_cnt * sizeof(numa_distance[0]);
+	size_t size = numa_distance_cnt * numa_distance_cnt *
+		      sizeof(numa_distance[0]);
 
 	/* numa_distance could be 1LU marking allocation failure, test cnt */
 	if (numa_distance_cnt)
 		memblock_free(numa_distance, size);
 	numa_distance_cnt = 0;
-	numa_distance = NULL;	/* enable table creation */
+	numa_distance = NULL; /* enable table creation */
 }
 
 static int __init numa_alloc_distance(void)
@@ -398,8 +400,8 @@ static int __init numa_alloc_distance(void)
 	/* fill with the default distances */
 	for (i = 0; i < cnt; i++)
 		for (j = 0; j < cnt; j++)
-			numa_distance[i * cnt + j] = i == j ?
-				LOCAL_DISTANCE : REMOTE_DISTANCE;
+			numa_distance[i * cnt + j] = i == j ? LOCAL_DISTANCE :
+							      REMOTE_DISTANCE;
 	printk(KERN_DEBUG "NUMA: Initialized distance table, cnt=%d\n", cnt);
 
 	return 0;
@@ -429,17 +431,19 @@ void __init numa_set_distance(int from, int to, int distance)
 	if (!numa_distance && numa_alloc_distance() < 0)
 		return;
 
-	if (from >= numa_distance_cnt || to >= numa_distance_cnt ||
-			from < 0 || to < 0) {
-		pr_warn_once("Warning: node ids are out of bound, from=%d to=%d distance=%d\n",
-			     from, to, distance);
+	if (from >= numa_distance_cnt || to >= numa_distance_cnt || from < 0 ||
+	    to < 0) {
+		pr_warn_once(
+			"Warning: node ids are out of bound, from=%d to=%d distance=%d\n",
+			from, to, distance);
 		return;
 	}
 
 	if ((u8)distance != distance ||
 	    (from == to && distance != LOCAL_DISTANCE)) {
-		pr_warn_once("Warning: invalid distance parameter, from=%d to=%d distance=%d\n",
-			     from, to, distance);
+		pr_warn_once(
+			"Warning: invalid distance parameter, from=%d to=%d distance=%d\n",
+			from, to, distance);
 		return;
 	}
 
@@ -482,7 +486,8 @@ static void __init numa_clear_kernel_node_hotplug(void)
 		struct numa_memblk *mb = numa_meminfo.blk + i;
 		int ret;
 
-		ret = memblock_set_node(mb->start, mb->end - mb->start, &memblock.reserved, mb->nid);
+		ret = memblock_set_node(mb->start, mb->end - mb->start,
+					&memblock.reserved, mb->nid);
 		WARN_ON_ONCE(ret);
 	}
 
@@ -676,8 +681,8 @@ static int __init dummy_numa_init(void)
 {
 	printk(KERN_INFO "%s\n",
 	       numa_off ? "NUMA turned off" : "No NUMA configuration found");
-	printk(KERN_INFO "Faking a node at [mem %#018Lx-%#018Lx]\n",
-	       0LLU, PFN_PHYS(max_pfn) - 1);
+	printk(KERN_INFO "Faking a node at [mem %#018Lx-%#018Lx]\n", 0LLU,
+	       PFN_PHYS(max_pfn) - 1);
 
 	node_set(0, numa_nodes_parsed);
 	numa_add_memblk(0, 0, PFN_PHYS(max_pfn));
@@ -709,7 +714,6 @@ void __init x86_numa_init(void)
 
 	numa_init(dummy_numa_init);
 }
-
 
 /*
  * A node may exist which has one or more Generic Initiators but no CPUs and no
@@ -786,7 +790,7 @@ void __init init_cpu_to_node(void)
 
 #ifndef CONFIG_DEBUG_PER_CPU_MAPS
 
-# ifndef CONFIG_NUMA_EMU
+#ifndef CONFIG_NUMA_EMU
 void numa_add_cpu(int cpu)
 {
 	cpumask_set_cpu(cpu, node_to_cpumask_map[early_cpu_to_node(cpu)]);
@@ -796,15 +800,14 @@ void numa_remove_cpu(int cpu)
 {
 	cpumask_clear_cpu(cpu, node_to_cpumask_map[early_cpu_to_node(cpu)]);
 }
-# endif	/* !CONFIG_NUMA_EMU */
+#endif /* !CONFIG_NUMA_EMU */
 
-#else	/* !CONFIG_DEBUG_PER_CPU_MAPS */
+#else /* !CONFIG_DEBUG_PER_CPU_MAPS */
 
 int __cpu_to_node(int cpu)
 {
 	if (early_per_cpu_ptr(x86_cpu_to_node_map)) {
-		printk(KERN_WARNING
-			"cpu_to_node(%d): usage too early!\n", cpu);
+		printk(KERN_WARNING "cpu_to_node(%d): usage too early!\n", cpu);
 		dump_stack();
 		return early_per_cpu_ptr(x86_cpu_to_node_map)[cpu];
 	}
@@ -822,8 +825,8 @@ int early_cpu_to_node(int cpu)
 		return early_per_cpu_ptr(x86_cpu_to_node_map)[cpu];
 
 	if (!cpu_possible(cpu)) {
-		printk(KERN_WARNING
-			"early_cpu_to_node(%d): no per_cpu area!\n", cpu);
+		printk(KERN_WARNING "early_cpu_to_node(%d): no per_cpu area!\n",
+		       cpu);
 		dump_stack();
 		return NUMA_NO_NODE;
 	}
@@ -851,12 +854,12 @@ void debug_cpumask_set_cpu(int cpu, int node, bool enable)
 		cpumask_clear_cpu(cpu, mask);
 
 	printk(KERN_DEBUG "%s cpu %d node %d: mask now %*pbl\n",
-		enable ? "numa_add_cpu" : "numa_remove_cpu",
-		cpu, node, cpumask_pr_args(mask));
+	       enable ? "numa_add_cpu" : "numa_remove_cpu", cpu, node,
+	       cpumask_pr_args(mask));
 	return;
 }
 
-# ifndef CONFIG_NUMA_EMU
+#ifndef CONFIG_NUMA_EMU
 static void numa_set_cpumask(int cpu, bool enable)
 {
 	debug_cpumask_set_cpu(cpu, early_cpu_to_node(cpu), enable);
@@ -871,7 +874,7 @@ void numa_remove_cpu(int cpu)
 {
 	numa_set_cpumask(cpu, false);
 }
-# endif	/* !CONFIG_NUMA_EMU */
+#endif /* !CONFIG_NUMA_EMU */
 
 /*
  * Returns a pointer to the bitmask of CPUs on Node 'node'.
@@ -880,15 +883,15 @@ const struct cpumask *cpumask_of_node(int node)
 {
 	if ((unsigned)node >= nr_node_ids) {
 		printk(KERN_WARNING
-			"cpumask_of_node(%d): (unsigned)node >= nr_node_ids(%u)\n",
-			node, nr_node_ids);
+		       "cpumask_of_node(%d): (unsigned)node >= nr_node_ids(%u)\n",
+		       node, nr_node_ids);
 		dump_stack();
 		return cpu_none_mask;
 	}
 	if (!cpumask_available(node_to_cpumask_map[node])) {
 		printk(KERN_WARNING
-			"cpumask_of_node(%d): no node_to_cpumask_map!\n",
-			node);
+		       "cpumask_of_node(%d): no node_to_cpumask_map!\n",
+		       node);
 		dump_stack();
 		return cpu_online_mask;
 	}
@@ -896,7 +899,7 @@ const struct cpumask *cpumask_of_node(int node)
 }
 EXPORT_SYMBOL(cpumask_of_node);
 
-#endif	/* !CONFIG_DEBUG_PER_CPU_MAPS */
+#endif /* !CONFIG_DEBUG_PER_CPU_MAPS */
 
 #ifdef CONFIG_NUMA_KEEP_MEMINFO
 static int meminfo_to_nid(struct numa_meminfo *mi, u64 start)

@@ -3196,8 +3196,8 @@ retry:
 			!__cpuset_zone_allowed(zone, gfp_mask))
 				continue;
 		/*
-		 * Refuse to hand out LTRAM pages to callers that didn't ask for
-		 * them.
+		 * Refuse to hand out LTRAM pages to callers without GFP_LTRAM
+		 * explicitly set.
 		 * We don't really expect to get here because ZONE_LTRAM is the
 		 * highest zone and because of the zonelist exclusion in
 		 * build_zonerefs_node, but just to be safe.
@@ -3206,6 +3206,7 @@ retry:
 			      !(gfp_mask & __GFP_LTRAM),
 			      "unexpected allocation from ZONE_LTRAM without __GFP_LTRAM\n"))
 			continue;
+
 		/*
 		 * When allocating a page cache page for writing, we
 		 * want to get it from a node that is within its dirty
