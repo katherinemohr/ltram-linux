@@ -9,6 +9,11 @@
 #include <linux/ltram.h>
 #include "internal.h"
 
+/*
+ * TODO(kmohr): This needs more exhaustive reviewing, but I'll leave it for now
+ * so this branch can get merged in and not block other work from progressing.
+ */
+
 static int __init ltram_init(void)
 {
 	struct zone *zone;
@@ -29,13 +34,10 @@ static int __init ltram_init(void)
 	/*
 	 * Remove the LTRAM node from N_MEMORY and N_NORMAL_MEMORY so that
 	 * kswapd, kcompactd, shrink_node(), and other per-N_MEMORY-node
-	 * subsystems never visit it. This runs at subsys_initcall (level 4),
-	 * before kswapd_init() and kcompactd_init() (module_init, level 6),
-	 * so no threads are created for this node.
-	 *
-	 * GFP_LTRAM allocations are unaffected: they bypass node_states
-	 * entirely and hardcode node_zonelist(LTRAM_NUMA_NODE, ...) in
-	 * prepare_alloc_pages().
+	 * subsystems never visit it.
+	 * This is intended to protect the LtRAM from threads like kswapd
+	 * and kcompactd.
+	 * TODO(kmohr): ensure this doesn't break anything.
 	 */
 	node_clear_state(LTRAM_NUMA_NODE, N_MEMORY);
 	node_clear_state(LTRAM_NUMA_NODE, N_NORMAL_MEMORY);

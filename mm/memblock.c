@@ -1483,10 +1483,7 @@ again:
 
 done:
 	/*
-	 * Warn if this allocation landed on the LTRAM node. memblock_search_pfn_nid
-	 * returns NUMA_NO_NODE before numa_init() tags regions; after that it
-	 * reflects the true nid. We can't undo the allocation at this point,
-	 * but the WARN prints a stack trace so the caller can be identified.
+	 * Warn if this allocation landed on the LTRAM node.
 	 */
 	{
 		unsigned long _start_pfn, _end_pfn;

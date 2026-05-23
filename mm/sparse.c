@@ -511,10 +511,9 @@ static void __init sparse_init_nid(int nid, unsigned long pnum_begin,
 	unsigned long pnum;
 	struct page *map;
 	/*
-	 * For the LTRAM node, allocate section metadata on node 0.
-	 * The non-HOTREMOVE usemap path uses pgdat->node_id directly, so
-	 * passing NODE_DATA(0) is the only way to redirect it; the vmemmap
-	 * buffer likewise must not consume LTRAM pages.
+	 * For the LtRAM node, allocate section metadata on node 0.
+	 * Kernel metadata is likely to be write-heavy, so we need to keep this
+	 * off of LtRAM.
 	 */
 	int alloc_nid = (nid == LTRAM_NUMA_NODE) ? 0 : nid;
 

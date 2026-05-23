@@ -207,8 +207,9 @@ static void __init alloc_node_data(int nid)
 	 * Allocate node data.  Try node-local memory and then any node.
 	 * Never allocate in DMA zone.
 	 *
-	 * For the LTRAM node, force allocation on node 0 — LTRAM pages must
-	 * not be consumed without an explicit GFP_LTRAM request.
+	 * It's a little odd not to store the node metadata on the actual node,
+	 * but we need to keep kernel data structures out of LtRAM, so allocate
+	 * node 1's (the LtRAM node) metadata on node 0.
 	 */
 	nd_pa = memblock_phys_alloc_try_nid(nd_size, SMP_CACHE_BYTES,
 					    nid == LTRAM_NUMA_NODE ? 0 : nid);
