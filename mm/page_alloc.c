@@ -17,6 +17,7 @@
 
 #include <linux/stddef.h>
 #include <linux/mm.h>
+#include <linux/ltram.h>
 #include <linux/highmem.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
@@ -253,6 +254,7 @@ static int sysctl_lowmem_reserve_ratio[MAX_NR_ZONES] = {
 	[ZONE_HIGHMEM] = 0,
 #endif
 	[ZONE_MOVABLE] = 0,
+	[ZONE_LTRAM] = 0,
 };
 
 char * const zone_names[MAX_NR_ZONES] = {
@@ -270,6 +272,7 @@ char * const zone_names[MAX_NR_ZONES] = {
 #ifdef CONFIG_ZONE_DEVICE
 	 "Device",
 #endif
+	 "LtRAM",
 };
 
 const char * const migratetype_names[MIGRATE_TYPES] = {
@@ -3193,6 +3196,18 @@ retry:
 			!__cpuset_zone_allowed(zone, gfp_mask))
 				continue;
 		/*
+		 * Refuse to hand out LTRAM pages to callers without GFP_LTRAM
+		 * explicitly set.
+		 * We don't really expect to get here because ZONE_LTRAM is the
+		 * highest zone and because of the zonelist exclusion in
+		 * build_zonerefs_node, but just to be safe.
+		 */
+		if (WARN_ONCE(zone_idx(zone) == ZONE_LTRAM &&
+			      !(gfp_mask & __GFP_LTRAM),
+			      "unexpected allocation from ZONE_LTRAM without __GFP_LTRAM\n"))
+			continue;
+
+		/*
 		 * When allocating a page cache page for writing, we
 		 * want to get it from a node that is within its dirty
 		 * limit, such that no single node holds more than its
@@ -3316,6 +3331,13 @@ try_this_zone:
 			 */
 			if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
 				reserve_highatomic_pageblock(page, zone);
+
+			/*
+			 * LTRAM allocations must be explicitly requested and must
+			 * only come from the LTRAM zone.
+			 */
+			VM_BUG_ON((gfp_mask & __GFP_LTRAM) !=
+				 (zone_idx(zone) == ZONE_LTRAM));
 
 			return page;
 		} else {
@@ -4320,8 +4342,13 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 		struct alloc_context *ac, gfp_t *alloc_gfp,
 		unsigned int *alloc_flags)
 {
-	ac->highest_zoneidx = gfp_zone(gfp_mask);
-	ac->zonelist = node_zonelist(preferred_nid, gfp_mask);
+	if (gfp_mask & __GFP_LTRAM) {
+		ac->highest_zoneidx = ZONE_LTRAM;
+		ac->zonelist = node_zonelist(LTRAM_NUMA_NODE, gfp_mask);
+	} else {
+		ac->highest_zoneidx = gfp_zone(gfp_mask);
+		ac->zonelist = node_zonelist(preferred_nid, gfp_mask);
+	}
 	ac->nodemask = nodemask;
 	ac->migratetype = gfp_migratetype(gfp_mask);
 
@@ -4955,7 +4982,8 @@ static int build_zonerefs_node(pg_data_t *pgdat, struct zoneref *zonerefs)
 	do {
 		zone_type--;
 		zone = pgdat->node_zones + zone_type;
-		if (populated_zone(zone)) {
+		if (populated_zone(zone) &&
+		    (zone_type != ZONE_LTRAM || pgdat->node_id == LTRAM_NUMA_NODE)) {
 			zoneref_set_zone(zone, &zonerefs[nr_zones++]);
 			check_highest_zone(zone_type);
 		}
@@ -5836,9 +5864,10 @@ static void __setup_per_zone_wmarks(void)
 	struct zone *zone;
 	unsigned long flags;
 
-	/* Calculate total number of !ZONE_HIGHMEM and !ZONE_MOVABLE pages */
+	/* Calculate total number of !ZONE_HIGHMEM and !ZONE_MOVABLE and !ZONE_LTRAM pages */
 	for_each_zone(zone) {
-		if (!is_highmem(zone) && zone_idx(zone) != ZONE_MOVABLE)
+		if (!is_highmem(zone) && zone_idx(zone) != ZONE_MOVABLE &&
+		    zone_idx(zone) != ZONE_LTRAM)
 			lowmem_pages += zone_managed_pages(zone);
 	}
 

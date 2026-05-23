@@ -29,6 +29,7 @@
 #include <linux/crash_dump.h>
 #include "internal.h"
 #include "slab.h"
+#include <linux/ltram.h>
 #include "shuffle.h"
 
 #include <asm/setup.h>
@@ -1278,16 +1279,32 @@ static void __init calculate_node_totalpages(struct pglist_data *pgdat,
 		unsigned long spanned, absent;
 		unsigned long real_size;
 
-		spanned = zone_spanned_pages_in_node(pgdat->node_id, i,
-						     node_start_pfn,
-						     node_end_pfn,
-						     &zone_start_pfn,
-						     &zone_end_pfn);
-		absent = zone_absent_pages_in_node(pgdat->node_id, i,
-						   zone_start_pfn,
-						   zone_end_pfn);
-
-		real_size = spanned - absent;
+		/*
+		 * LTRAM override: node LTRAM_NUMA_NODE is dedicated entirely to
+		 * ZONE_LTRAM. Give that zone the full node range; zero all others.
+		 * NOR flash memory is contiguous, so absent = 0.
+		 */
+		if (pgdat->node_id == LTRAM_NUMA_NODE) {
+			if (i == ZONE_LTRAM) {
+				zone_start_pfn = node_start_pfn;
+				spanned        = node_end_pfn - node_start_pfn;
+			} else {
+				zone_start_pfn = 0;
+				spanned        = 0;
+			}
+			absent    = 0;
+			real_size = spanned;
+		} else {
+			spanned = zone_spanned_pages_in_node(pgdat->node_id, i,
+							     node_start_pfn,
+							     node_end_pfn,
+							     &zone_start_pfn,
+							     &zone_end_pfn);
+			absent    = zone_absent_pages_in_node(pgdat->node_id, i,
+							      zone_start_pfn,
+							      zone_end_pfn);
+			real_size = spanned - absent;
+		}
 
 		if (spanned)
 			zone->zone_start_pfn = zone_start_pfn;
@@ -1572,7 +1589,7 @@ static void __init free_area_init_core(struct pglist_data *pgdat)
 		 * and per-cpu initialisations
 		 */
 		memmap_pages = calc_memmap_size(size, freesize);
-		if (!is_highmem_idx(j)) {
+		if (!is_highmem_idx(j) && j != ZONE_LTRAM) {
 			if (freesize >= memmap_pages) {
 				freesize -= memmap_pages;
 				if (memmap_pages)
@@ -1589,7 +1606,7 @@ static void __init free_area_init_core(struct pglist_data *pgdat)
 			pr_debug("  %s zone: %lu pages reserved\n", zone_names[0], dma_reserve);
 		}
 
-		if (!is_highmem_idx(j))
+		if (!is_highmem_idx(j) && j != ZONE_LTRAM)
 			nr_kernel_pages += freesize;
 		/* Charge for highmem memmap if there are enough kernel pages */
 		else if (nr_kernel_pages > memmap_pages * 2)
@@ -1732,6 +1749,7 @@ static void __init free_area_init_node(int nid)
 
 	free_area_init_core(pgdat);
 	lru_gen_init_pgdat(pgdat);
+
 }
 
 /* Any regular or high memory on that node ? */

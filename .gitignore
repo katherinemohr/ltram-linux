@@ -55,6 +55,14 @@ Module.symvers
 modules.order
 
 #
+# More auto-generated stuff
+#
+arch/x86/entry/vdso/vdso64/vdso64-image.c
+arch/x86/entry/vdso/vdso64/vdso64.lds
+lib/crc/crc32table.h
+lib/crc/crc64table.h
+
+#
 # Top-level generic files
 #
 /linux

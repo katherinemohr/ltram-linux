@@ -136,6 +136,8 @@ enum pageflags {
 	PG_arch_2,
 	PG_arch_3,
 #endif
+	// TODO(kmohr): maybe add this back?
+	// PG_ltram,		/* backed by ltram */
 	__NR_PAGEFLAGS,
 
 	PG_readahead = PG_reclaim,

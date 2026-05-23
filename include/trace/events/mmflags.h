@@ -39,6 +39,7 @@
 	gfpflag_string(__GFP_NORETRY),		\
 	gfpflag_string(__GFP_COMP),		\
 	gfpflag_string(__GFP_ZERO),		\
+	gfpflag_string(__GFP_LTRAM),		\
 	gfpflag_string(__GFP_NOMEMALLOC),	\
 	gfpflag_string(__GFP_MEMALLOC),		\
 	gfpflag_string(__GFP_HARDWALL),		\

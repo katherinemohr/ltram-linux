@@ -4,6 +4,7 @@
  */
 #include <linux/mm.h>
 #include <linux/slab.h>
+#include <linux/ltram.h>
 #include <linux/mmzone.h>
 #include <linux/memblock.h>
 #include <linux/compiler.h>
@@ -509,14 +510,20 @@ static void __init sparse_init_nid(int nid, unsigned long pnum_begin,
 	struct mem_section_usage *usage;
 	unsigned long pnum;
 	struct page *map;
+	/*
+	 * For the LtRAM node, allocate section metadata on node 0.
+	 * Kernel metadata is likely to be write-heavy, so we need to keep this
+	 * off of LtRAM.
+	 */
+	int alloc_nid = (nid == LTRAM_NUMA_NODE) ? 0 : nid;
 
-	usage = sparse_early_usemaps_alloc_pgdat_section(NODE_DATA(nid),
+	usage = sparse_early_usemaps_alloc_pgdat_section(NODE_DATA(alloc_nid),
 			mem_section_usage_size() * map_count);
 	if (!usage) {
 		pr_err("%s: node[%d] usemap allocation failed", __func__, nid);
 		goto failed;
 	}
-	sparse_buffer_init(map_count * section_map_size(), nid);
+	sparse_buffer_init(map_count * section_map_size(), alloc_nid);
 	for_each_present_section_nr(pnum_begin, pnum) {
 		unsigned long pfn = section_nr_to_pfn(pnum);
 
@@ -524,7 +531,7 @@ static void __init sparse_init_nid(int nid, unsigned long pnum_begin,
 			break;
 
 		map = __populate_section_memmap(pfn, PAGES_PER_SECTION,
-				nid, NULL, NULL);
+				alloc_nid, NULL, NULL);
 		if (!map) {
 			pr_err("%s: node[%d] memory map backing failed. Some memory will not be available.",
 			       __func__, nid);
