@@ -3335,8 +3335,15 @@ try_this_zone:
 			/*
 			 * LTRAM allocations must be explicitly requested and must
 			 * only come from the LTRAM zone.
+			 *
+			 * Note: (gfp_mask & __GFP_LTRAM) yields the raw bit value
+			 * (0x200), not a 0/1 boolean, so it must be normalized with
+			 * !! before comparing against the (zone_idx == ZONE_LTRAM)
+			 * boolean. Without !! this assertion fires on every correct
+			 * LtRAM allocation (512 != 1), but only when CONFIG_DEBUG_VM
+			 * is enabled.
 			 */
-			VM_BUG_ON((gfp_mask & __GFP_LTRAM) !=
+			VM_BUG_ON(!!(gfp_mask & __GFP_LTRAM) !=
 				 (zone_idx(zone) == ZONE_LTRAM));
 
 			return page;

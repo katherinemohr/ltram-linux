@@ -2932,18 +2932,44 @@ pte_unlock:
 	return ret;
 }
 
-static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
+static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma,
+				  unsigned long address)
 {
 	struct file *vm_file = vma->vm_file;
+	gfp_t gfp;
 
 	if (vm_file)
-		return mapping_gfp_mask(vm_file->f_mapping) | __GFP_FS | __GFP_IO;
+		gfp = mapping_gfp_mask(vm_file->f_mapping) | __GFP_FS | __GFP_IO;
+	else
+		/*
+		 * Special mappings (e.g. VDSO) do not have any file so fake
+		 * a default GFP_KERNEL for them.
+		 */
+		gfp = GFP_KERNEL;
 
 	/*
-	 * Special mappings (e.g. VDSO) do not have any file so fake
-	 * a default GFP_KERNEL for them.
+	 * LtRAM auto-routing: send allocations for read-only VMAs to
+	 * ZONE_LTRAM. Catches text segments, read-only file mmaps, vDSO,
+	 * and read-only anonymous mappings. The kernel does no automatic
+	 * migration if the VMA is later mprotect()'d writable; the
+	 * resulting write fault would need to repatriate to DRAM.
+	 *
+	 * Skip categories where the allocator does not own pages normally:
+	 *  - VM_HUGETLB: huge-page semantics
+	 *  - VM_IO / VM_PFNMAP: device memory
+	 *  - VM_MIXEDMAP: special mappings
 	 */
-	return GFP_KERNEL;
+	if (!(vma->vm_flags & VM_WRITE) &&
+	    (vma->vm_flags & VM_READ) &&
+	    !(vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP))) {
+		gfp |= __GFP_LTRAM | __GFP_THISNODE;
+		pr_debug("ltram: route va=0x%lx vm_flags=0x%lx file=%s\n",
+			 address, vma->vm_flags,
+			 vm_file ? vm_file->f_path.dentry->d_name.name
+				 : (const unsigned char *)"(anon)");
+	}
+
+	return gfp;
 }
 
 /*
@@ -4761,6 +4787,27 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
 
 	ret |= finish_fault(vmf);
 	folio = page_folio(vmf->page);
+
+	/*
+	 * LtRAM debug: log the resolved outcome of read-only file-backed
+	 * faults so we can see where the page actually landed.
+	 */
+	{
+		struct vm_area_struct *_vma = vmf->vma;
+		if (!(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)) &&
+		    !(_vma->vm_flags & VM_WRITE) &&
+		    (_vma->vm_flags & VM_READ) &&
+		    !(_vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP))) {
+			pr_debug("ltram: resolved va=0x%lx pa=0x%llx nid=%d zone=%d file=%s\n",
+				 vmf->address,
+				 (u64)page_to_phys(vmf->page),
+				 page_to_nid(vmf->page),
+				 page_zonenum(vmf->page),
+				 _vma->vm_file ? _vma->vm_file->f_path.dentry->d_name.name
+					       : (const unsigned char *)"(anon)");
+		}
+	}
+
 	folio_unlock(folio);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		folio_put(folio);
@@ -5220,7 +5267,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 		.real_address = address,
 		.flags = flags,
 		.pgoff = linear_page_index(vma, address),
-		.gfp_mask = __get_fault_gfp_mask(vma),
+		.gfp_mask = __get_fault_gfp_mask(vma, address & PAGE_MASK),
 	};
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long vm_flags = vma->vm_flags;
