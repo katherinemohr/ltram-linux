@@ -957,6 +957,12 @@ struct task_struct {
 	/* Recursion prevention for eventfd_signal() */
 	unsigned			in_eventfd:1;
 #endif
+	/*
+	 * LtRAM: set while this task runs a DRAM->LtRAM migration so that
+	 * post_alloc_hook() can attribute the destination page's placement
+	 * (migrated-in vs allocated). Read only inside the LtRAM accounting path.
+	 */
+	unsigned			ltram_migrate_active:1;
 #ifdef CONFIG_ARCH_HAS_CPU_PASID
 	unsigned			pasid_activated:1;
 #endif

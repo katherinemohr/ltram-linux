@@ -1535,6 +1535,9 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 
 	set_page_owner(page, order, gfp_flags);
 	page_table_check_alloc(page, order);
+
+	/* LtRAM wear/placement accounting; nop unless LtRAM is present (static key). */
+	ltram_note_alloc(page, order); 
 }
 
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,

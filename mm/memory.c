@@ -67,6 +67,7 @@
 #include <linux/elf.h>
 #include <linux/gfp.h>
 #include <linux/migrate.h>
+#include <linux/ltram.h>
 #include <linux/string.h>
 #include <linux/memory-tiers.h>
 #include <linux/debugfs.h>
@@ -3514,6 +3515,10 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	 */
 	if (folio && folio_zonenum(folio) == ZONE_LTRAM) {
 		struct file *vm_file = vma->vm_file;
+
+		/* Count this page once, split by placement origin, for the
+		 * read-only-fraction stats (alloc vs migrated). */
+		ltram_note_write_fault(folio);
 
 		pr_info_ratelimited("ltram: write-fault on LtRAM page va=0x%lx pfn=0x%lx vm_flags=0x%lx file=%s\n",
 			vmf->address, folio_pfn(folio), vma->vm_flags,
