@@ -3503,6 +3503,25 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 		folio = page_folio(vmf->page);
 
 	/*
+	 * LtRAM repatriation detector. A write fault landing on a folio that
+	 * lives in ZONE_LTRAM means a page we routed to LtRAM (because its VMA
+	 * was read-only at fault time) is now being written -- exactly the case
+	 * that would require repatriating the page to DRAM. Repatriation is not
+	 * yet wired up (ltram_migrate_from() has no callers), so there is no new
+	 * PA to report; we log the current LtRAM pfn plus enough identity (VA,
+	 * vm_flags, backing file) to map the page back to a data structure.
+	 * Ratelimited so a fault storm cannot flood the console.
+	 */
+	if (folio && folio_zonenum(folio) == ZONE_LTRAM) {
+		struct file *vm_file = vma->vm_file;
+
+		pr_info_ratelimited("ltram: write-fault on LtRAM page va=0x%lx pfn=0x%lx vm_flags=0x%lx file=%s\n",
+			vmf->address, folio_pfn(folio), vma->vm_flags,
+			vm_file ? vm_file->f_path.dentry->d_name.name
+				: (const unsigned char *)"(anon)");
+	}
+
+	/*
 	 * Shared mapping: we are guaranteed to have VM_WRITE and
 	 * FAULT_FLAG_WRITE set at this point.
 	 */
