@@ -1179,6 +1179,9 @@ static __always_inline bool free_pages_prepare(struct page *page,
 
 	debug_pagealloc_unmap_pages(page, 1 << order);
 
+	/* LtRAM accounting: a page leaving the allocator (frees mirror allocs). */
+	ltram_note_free(page, order);
+
 	return true;
 }
 

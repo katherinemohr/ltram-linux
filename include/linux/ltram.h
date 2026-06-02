@@ -31,11 +31,18 @@ void ltram_note_write_fault(struct folio *folio);
 DECLARE_STATIC_KEY_FALSE(ltram_accounting_enabled);
 
 void __ltram_note_alloc(struct page *page, unsigned int order);
+void __ltram_note_free(struct page *page, unsigned int order);
 
 static inline void ltram_note_alloc(struct page *page, unsigned int order)
 {
 	if (static_branch_unlikely(&ltram_accounting_enabled))
 		__ltram_note_alloc(page, order);
+}
+
+static inline void ltram_note_free(struct page *page, unsigned int order)
+{
+	if (static_branch_unlikely(&ltram_accounting_enabled))
+		__ltram_note_free(page, order);
 }
 
 #endif /* _LINUX_LTRAM_H */

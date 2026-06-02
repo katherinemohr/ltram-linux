@@ -9,6 +9,7 @@
 #include <linux/ltram.h>
 #include <linux/sched.h>
 #include <linux/vmalloc.h>
+#include <linux/slab.h>
 #include <linux/vmstat.h>
 #include <linux/percpu.h>
 #include <linux/cpumask.h>
@@ -52,6 +53,9 @@ static DEFINE_PER_CPU(unsigned long, ltram_migrated_back_of_migrated);
  * migrated is the placement-policy quality signal. */
 static DEFINE_PER_CPU(unsigned long, ltram_write_faulted_of_alloc);
 static DEFINE_PER_CPU(unsigned long, ltram_write_faulted_of_migrated);
+/* Pages leaving ZONE_LTRAM (frees). placed - freed = net change in residency,
+ * which exposes churn (how transient LtRAM placements are). */
+static DEFINE_PER_CPU(unsigned long, ltram_freed);
 
 /*
  * Record an allocation of @page (1<<order frames) into ZONE_LTRAM. Reached
@@ -82,6 +86,15 @@ void __ltram_note_alloc(struct page *page, unsigned int order)
 		ltram_frame_origin[idx] = origin;
 	}
 	this_cpu_add(ltram_total_programs, n);
+}
+
+/* Record a page (1<<order frames) leaving ZONE_LTRAM. Mirror of note_alloc;
+ * reached from free_pages_prepare() only when accounting is enabled. */
+void __ltram_note_free(struct page *page, unsigned int order)
+{
+	if (page_zonenum(page) != ZONE_LTRAM)
+		return;
+	this_cpu_add(ltram_freed, 1u << order);
 }
 
 /* Provenance recorded for the frame backing @folio (must be in ZONE_LTRAM). */
@@ -129,6 +142,7 @@ void ltram_note_write_fault(struct folio *folio)
 static int ltram_stats_show(struct seq_file *m, void *v)
 {
 	unsigned long total = 0, mig_in = 0, mb_a = 0, mb_m = 0, wf_a = 0, wf_m = 0;
+	unsigned long freed = 0;
 	unsigned long resident, mn = U32_MAX, mx = 0, sum = 0, nz = 0, i;
 	unsigned long placed_a, placed_m;
 	int cpu;
@@ -140,6 +154,7 @@ static int ltram_stats_show(struct seq_file *m, void *v)
 		mb_m   += per_cpu(ltram_migrated_back_of_migrated, cpu);
 		wf_a   += per_cpu(ltram_write_faulted_of_alloc, cpu);
 		wf_m   += per_cpu(ltram_write_faulted_of_migrated, cpu);
+		freed  += per_cpu(ltram_freed, cpu);
 	}
 	placed_a = total - mig_in;	/* allocation-time placements */
 	placed_m = mig_in;		/* migrated-in placements     */
@@ -175,6 +190,8 @@ static int ltram_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "read_only_permille_migrated %lu\n",
 		   placed_m ? ((placed_m - wf_m) * 1000) / placed_m : 1000);
 	seq_printf(m, "total_programs             %lu\n", total);
+	seq_printf(m, "freed                      %lu\n", freed);
+	seq_printf(m, "net_programmed             %ld\n", (long)total - (long)freed);
 	seq_printf(m, "currently_resident_pages   %lu\n", resident);
 	seq_printf(m, "frames_total               %lu\n", ltram_nr_frames);
 	seq_printf(m, "frames_ever_programmed     %lu\n", nz);
@@ -184,6 +201,38 @@ static int ltram_stats_show(struct seq_file *m, void *v)
 	/* skew = max / mean, x1000; 1000 == perfectly even */
 	seq_printf(m, "skew_max_over_mean_x1000   %lu\n",
 		   (nz && sum) ? (mx * 1000UL * nz) / sum : 0);
+
+	/* Exact median and mode of the per-frame erase counts, over programmed
+	 * frames only (values are small integers, so a counting array is cheap;
+	 * cap it so a long campaign can't ask for an absurd allocation). */
+	{
+		unsigned long cap = min(mx, 65536UL);
+		unsigned long *hist = nz ? kcalloc(cap + 1, sizeof(*hist), GFP_KERNEL)
+					 : NULL;
+		unsigned long med = 0, mode = 0, mode_cnt = 0, acc = 0;
+
+		if (hist) {
+			for (i = 0; i < ltram_nr_frames; i++) {
+				u32 c = ltram_erase_count[i];
+
+				if (c)
+					hist[c > cap ? cap : c]++;
+			}
+			for (i = 1; i <= cap; i++) {
+				if (hist[i] > mode_cnt) {
+					mode_cnt = hist[i];
+					mode = i;
+				}
+				acc += hist[i];
+				if (!med && acc >= (nz + 1) / 2)
+					med = i;
+			}
+			kfree(hist);
+		}
+		seq_printf(m, "erase_count_median         %lu\n", med);
+		seq_printf(m, "erase_count_mode           %lu\n", mode);
+	}
+
 	seq_puts(m, "# erase_count models NOR program cycles per 4KB frame\n");
 	return 0;
 }
@@ -271,6 +320,7 @@ static ssize_t ltram_reset_write(struct file *f, const char __user *buf,
 		per_cpu(ltram_migrated_back_of_migrated, cpu) = 0;
 		per_cpu(ltram_write_faulted_of_alloc, cpu) = 0;
 		per_cpu(ltram_write_faulted_of_migrated, cpu) = 0;
+		per_cpu(ltram_freed, cpu) = 0;
 	}
 	return len;
 }
