@@ -19,9 +19,17 @@ struct page;
 int ltram_migrate_to(struct folio *folio);
 int ltram_migrate_from(struct folio *folio);
 
+/* Endurance rate limiter for DRAM->LtRAM placement: spend one token per
+ * migration; false => over budget this instant, skip. */
+bool ltram_token_try_consume(void);
+
 /* Called from do_wp_page() when a write fault lands on a ZONE_LTRAM folio;
  * counts each placed page once, split by placement origin. */
 void ltram_note_write_fault(struct folio *folio);
+
+/* Called from wp_page_copy() when an LtRAM folio is copied back to DRAM
+ * (repatriation on write); counts it against migrated_back, by origin. */
+void ltram_note_repatriated(struct folio *folio);
 
 /*
  * Runtime instrumentation gate. Enabled by ltram_init() once a populated

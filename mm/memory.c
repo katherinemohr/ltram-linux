@@ -2951,21 +2951,30 @@ static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma,
 	/*
 	 * LtRAM auto-routing: send allocations for read-only VMAs to
 	 * ZONE_LTRAM. Catches text segments, read-only file mmaps, vDSO,
-	 * and read-only anonymous mappings. The kernel does no automatic
-	 * migration if the VMA is later mprotect()'d writable; the
-	 * resulting write fault would need to repatriate to DRAM.
+	 * and read-only anonymous mappings. If the VMA is later mprotect()'d
+	 * writable, the resulting write fault repatriates the page to DRAM via
+	 * copy-on-write in do_wp_page() (see ltram_note_repatriated()).
 	 *
 	 * Skip categories where the allocator does not own pages normally:
 	 *  - VM_HUGETLB: huge-page semantics
 	 *  - VM_IO / VM_PFNMAP: device memory
 	 *  - VM_MIXEDMAP: special mappings
+	 *
+	 * Also skip SHARED mappings (VM_SHARED | VM_MAYSHARE): COW repatriation
+	 * cannot preserve shared-write semantics, so a shared LtRAM page would be
+	 * written in place (a flash write). Excluding them keeps every LtRAM page
+	 * private, so the COW repatriation path is always correct.
+	 * TODO: handle shared pages instead via ltram_migrate_from() (migrate_pages,
+	 * rewrites all rmap entries) and compare against this exclude policy.
 	 */
 	if (!(vma->vm_flags & VM_WRITE) &&
 	    (vma->vm_flags & VM_READ) &&
+	    !(vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) &&
 	    !(vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP))) {
 		gfp |= __GFP_LTRAM | __GFP_THISNODE;
-		pr_debug("ltram: route va=0x%lx vm_flags=0x%lx file=%s\n",
-			 address, vma->vm_flags,
+		/* Visible (ratelimited) so a run shows read-only pages routed in. */
+		pr_info_ratelimited("ltram: route->LtRAM va=0x%lx file=%s\n",
+			 address,
 			 vm_file ? vm_file->f_path.dentry->d_name.name
 				 : (const unsigned char *)"(anon)");
 	}
@@ -3265,6 +3274,14 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 			folio_remove_rmap_pte(old_folio, vmf->page, vma);
 		}
 
+		/*
+		 * If the source page lived in LtRAM, this copy just repatriated
+		 * it to DRAM (the new page is GFP_HIGHUSER_MOVABLE). Account it
+		 * before the old_folio reference is repurposed for freeing.
+		 */
+		if (old_folio && folio_zonenum(old_folio) == ZONE_LTRAM)
+			ltram_note_repatriated(old_folio);
+
 		/* Free the old page.. */
 		new_folio = old_folio;
 		page_copied = 1;
@@ -3465,6 +3482,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	const bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio = NULL;
+	bool wp_ltram = false;
 	pte_t pte;
 
 	if (likely(!unshare)) {
@@ -3504,24 +3522,27 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 		folio = page_folio(vmf->page);
 
 	/*
-	 * LtRAM repatriation detector. A write fault landing on a folio that
-	 * lives in ZONE_LTRAM means a page we routed to LtRAM (because its VMA
-	 * was read-only at fault time) is now being written -- exactly the case
-	 * that would require repatriating the page to DRAM. Repatriation is not
-	 * yet wired up (ltram_migrate_from() has no callers), so there is no new
-	 * PA to report; we log the current LtRAM pfn plus enough identity (VA,
-	 * vm_flags, backing file) to map the page back to a data structure.
-	 * Ratelimited so a fault storm cannot flood the console.
+	 * LtRAM repatriation. A write fault landing on a folio in ZONE_LTRAM
+	 * means a page we routed to LtRAM (because its VMA was read-only at
+	 * fault time) is now being written. LtRAM must not be written in place,
+	 * so we force the copy-on-write path below: wp_page_copy() allocates a
+	 * fresh DRAM page (GFP_HIGHUSER_MOVABLE, never __GFP_LTRAM), copies the
+	 * contents, maps it writable, and drops the LtRAM page -- i.e. the page
+	 * is repatriated to DRAM and the write retries on the DRAM copy.
+	 *
+	 * File-backed LtRAM pages already reach wp_page_copy (not anon); the
+	 * reuse-in-place path below is reachable only for anonymous exclusive
+	 * pages, which is why we must skip it for LtRAM. (Shared mappings do not
+	 * carry __GFP_LTRAM, so shared LtRAM pages do not occur in practice.)
 	 */
-	if (folio && folio_zonenum(folio) == ZONE_LTRAM) {
+	wp_ltram = folio && folio_zonenum(folio) == ZONE_LTRAM;
+	if (wp_ltram) {
 		struct file *vm_file = vma->vm_file;
 
-		/* Count this page once, split by placement origin, for the
-		 * read-only-fraction stats (alloc vs migrated). */
-		ltram_note_write_fault(folio);
-
-		pr_info_ratelimited("ltram: write-fault on LtRAM page va=0x%lx pfn=0x%lx vm_flags=0x%lx file=%s\n",
-			vmf->address, folio_pfn(folio), vma->vm_flags,
+		ltram_note_write_fault(folio);	/* count the write-fault event */
+		/* Visible (ratelimited) so a run shows pages bouncing LtRAM->DRAM. */
+		pr_info_ratelimited("ltram: repatriate LtRAM->DRAM va=0x%lx pfn=0x%lx file=%s\n",
+			vmf->address, folio_pfn(folio),
 			vm_file ? vm_file->f_path.dentry->d_name.name
 				: (const unsigned char *)"(anon)");
 	}
@@ -3550,7 +3571,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	 * If we encounter a page that is marked exclusive, we must reuse
 	 * the page without further checks.
 	 */
-	if (folio && folio_test_anon(folio) &&
+	if (!wp_ltram && folio && folio_test_anon(folio) &&
 	    (PageAnonExclusive(vmf->page) || wp_can_reuse_anon_folio(folio, vma))) {
 		if (!PageAnonExclusive(vmf->page))
 			SetPageAnonExclusive(vmf->page);

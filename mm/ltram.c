@@ -17,7 +17,16 @@
 #include <linux/seq_file.h>
 #include <linux/fs.h>
 #include <linux/log2.h>
+#include <linux/ktime.h>
 #include <linux/moduleparam.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/task.h>
+#include <linux/pid.h>
+#include <linux/swap.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/pagewalk.h>
+#include <linux/uaccess.h>
 #include "internal.h"
 
 /*
@@ -56,6 +65,79 @@ static DEFINE_PER_CPU(unsigned long, ltram_write_faulted_of_migrated);
 /* Pages leaving ZONE_LTRAM (frees). placed - freed = net change in residency,
  * which exposes churn (how transient LtRAM placements are). */
 static DEFINE_PER_CPU(unsigned long, ltram_freed);
+
+/* ---- scanning hand (autonomous DRAM->LtRAM placement policy) state -------- */
+static int ltram_scan_pid;			/* 0/-1 = off                  */
+static unsigned int ltram_scan_interval_ms = 100;
+static unsigned int ltram_scan_batch = 4096;	/* PTEs visited per wake       */
+static unsigned int ltram_scan_max_migrate = 64;/* candidates queued per wake  */
+module_param_named(scan_interval_ms, ltram_scan_interval_ms, uint, 0644);
+module_param_named(scan_batch, ltram_scan_batch, uint, 0644);
+module_param_named(scan_max_migrate, ltram_scan_max_migrate, uint, 0644);
+static struct task_struct *ltram_scan_task;
+static unsigned long ltram_scan_cursor;		/* resume address across wakes */
+static unsigned long ltram_scan_passes;		/* sweeps performed (display)  */
+static unsigned long ltram_scan_total_migrated;	/* migrated by the scan        */
+static unsigned long ltram_scan_last_cand;	/* candidates found last wake  */
+
+/* ---- endurance token bucket (DRAM->LtRAM placement rate limiter) ---------
+ * NOR endurance 10^5 cycles, 5-year life, 65536 frames:
+ *   65536 * 1e5 / (5*365.25*86400) ~= 42 programs/s sustained.
+ * Each placement migration spends one token. Time-based refill; tokens kept in
+ * milli-units so sub-second refill works at low rates. token_rate=0 disables
+ * the limit (bring-up). Valid as a device-wide budget only WITH wear-leveling
+ * (else the hottest frame's 10^5 limit binds first -- see
+ * docs/wear_leveling_allocator.md). */
+static unsigned int ltram_token_rate = 42;	/* tokens/sec */
+static unsigned int ltram_token_cap  = 512;	/* burst cap  */
+module_param_named(token_rate, ltram_token_rate, uint, 0644);
+module_param_named(token_cap,  ltram_token_cap,  uint, 0644);
+
+static DEFINE_SPINLOCK(ltram_token_lock);
+static u64 ltram_tokens_milli;			/* available tokens x1000 */
+static u64 ltram_token_last_ns;
+
+/* Refill by elapsed time; caller holds ltram_token_lock. */
+static void ltram_token_refill_locked(void)
+{
+	u64 now = ktime_get_ns();
+	u64 cap = (u64)ltram_token_cap * 1000ULL;
+
+	ltram_tokens_milli += ((now - ltram_token_last_ns) * ltram_token_rate)
+			      / 1000000ULL;
+	ltram_token_last_ns = now;
+	if (ltram_tokens_milli > cap)
+		ltram_tokens_milli = cap;
+}
+
+/* Spend one token if available; true => a placement migration may proceed. */
+bool ltram_token_try_consume(void)
+{
+	bool ok = false;
+
+	if (!ltram_token_rate)			/* 0 == unlimited */
+		return true;
+	spin_lock(&ltram_token_lock);
+	ltram_token_refill_locked();
+	if (ltram_tokens_milli >= 1000ULL) {
+		ltram_tokens_milli -= 1000ULL;
+		ok = true;
+	}
+	spin_unlock(&ltram_token_lock);
+	return ok;
+}
+
+/* Current token count (for stats). */
+static unsigned long ltram_tokens_now(void)
+{
+	unsigned long t;
+
+	spin_lock(&ltram_token_lock);
+	ltram_token_refill_locked();
+	t = (unsigned long)(ltram_tokens_milli / 1000ULL);
+	spin_unlock(&ltram_token_lock);
+	return t;
+}
 
 /*
  * Record an allocation of @page (1<<order frames) into ZONE_LTRAM. Reached
@@ -105,6 +187,22 @@ static u8 ltram_folio_origin(struct folio *folio)
 	if (!ltram_frame_origin || idx >= ltram_nr_frames)
 		return LTRAM_ORIGIN_ALLOC;
 	return ltram_frame_origin[idx] & LTRAM_ORIGIN_MASK;
+}
+
+/*
+ * An LtRAM folio is being copied back to DRAM by wp_page_copy() (write-fault
+ * repatriation). Count it against migrated_back, split by placement origin, so
+ * the stats show how many LtRAM pages had to be pulled back because they were
+ * written. read_only_permille_migrated quantifies migration-policy quality.
+ */
+void ltram_note_repatriated(struct folio *folio)
+{
+	if (!ltram_frame_origin)
+		return;
+	if (ltram_folio_origin(folio) == LTRAM_ORIGIN_MIGRATED)
+		this_cpu_inc(ltram_migrated_back_of_migrated);
+	else
+		this_cpu_inc(ltram_migrated_back_of_alloc);
 }
 
 /*
@@ -233,7 +331,14 @@ static int ltram_stats_show(struct seq_file *m, void *v)
 		seq_printf(m, "erase_count_mode           %lu\n", mode);
 	}
 
+	seq_printf(m, "token_rate_per_s           %u\n", ltram_token_rate);
+	seq_printf(m, "tokens_available           %lu\n", ltram_tokens_now());
+	seq_printf(m, "scan_pid                   %d\n", READ_ONCE(ltram_scan_pid));
+	seq_printf(m, "scan_passes                %lu\n", ltram_scan_passes);
+	seq_printf(m, "scan_migrated              %lu\n", ltram_scan_total_migrated);
+	seq_printf(m, "scan_last_candidates       %lu\n", ltram_scan_last_cand);
 	seq_puts(m, "# erase_count models NOR program cycles per 4KB frame\n");
+	seq_puts(m, "# tokens: endurance budget for DRAM->LtRAM placement (~42/s)\n");
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ltram_stats);
@@ -331,6 +436,350 @@ static const struct file_operations ltram_reset_fops = {
 	.llseek	= noop_llseek,
 };
 
+/*
+ * Write-protect the PTE mapping @va in @mm so the next write faults into
+ * do_wp_page() -> COW repatriation. Single-PTE: correct for private,
+ * single-mapped pages (the placement target). A page mapped in several
+ * processes (COW after fork) would need an rmap walk to cover every PTE; TODO.
+ */
+static void ltram_wrprotect_va(struct mm_struct *mm, unsigned long va)
+{
+	struct vm_area_struct *vma;
+	pte_t *ptep, pte;
+	spinlock_t *ptl;
+
+	mmap_read_lock(mm);
+	vma = vma_lookup(mm, va);
+	if (vma && follow_pte(mm, va, &ptep, &ptl) == 0) {
+		pte = ptep_get(ptep);
+		if (pte_present(pte) && pte_write(pte)) {
+			flush_cache_page(vma, va, pte_pfn(pte));
+			pte = ptep_clear_flush(vma, va, ptep);
+			set_pte_at(mm, va, ptep, pte_wrprotect(pte));
+		}
+		pte_unmap_unlock(ptep, ptl);
+	}
+	mmap_read_unlock(mm);
+}
+
+/*
+ * Migrate the single page at @va in @mm into LtRAM and write-protect it so a
+ * later write faults -> do_wp_page COW repatriation. Caller must have drained
+ * the per-CPU LRU (lru_add_drain_all) so the page is isolable. Skips ineligible
+ * VMAs. Returns 0 (migrated, or already in LtRAM) or a negative errno.
+ */
+static int ltram_migrate_one(struct mm_struct *mm, unsigned long va)
+{
+	struct vm_area_struct *vma;
+	struct page *page;
+	struct folio *folio;
+	int ret;
+
+	mmap_read_lock(mm);
+	vma = vma_lookup(mm, va);
+	if (!vma ||
+	    !(vma->vm_flags & VM_WRITE) ||			/* RO already LtRAM-eligible */
+	    (vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) ||	/* shared excluded */
+	    (vma->vm_flags & VM_GROWSDOWN) ||			/* stack */
+	    (vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP))) {
+		mmap_read_unlock(mm);
+		return -EINVAL;
+	}
+	page = follow_page(vma, va, FOLL_GET);			/* refs the page */
+	mmap_read_unlock(mm);
+	if (IS_ERR_OR_NULL(page))
+		return -EFAULT;
+	folio = page_folio(page);
+	if (folio_zonenum(folio) == ZONE_LTRAM) {		/* already there */
+		folio_put(folio);
+		return 0;
+	}
+	ret = ltram_migrate_to(folio);				/* consumes the ref */
+	if (!ret)
+		ltram_wrprotect_va(mm, va);
+	return ret;
+}
+
+/* Resolve "<pid>" to its mm with a reference held, or NULL. */
+static struct mm_struct *ltram_get_mm(int pid)
+{
+	struct task_struct *task = find_get_task_by_vpid(pid);
+	struct mm_struct *mm;
+
+	if (!task)
+		return NULL;
+	mm = get_task_mm(task);
+	put_task_struct(task);
+	return mm;
+}
+
+/*
+ * debugfs: write "<pid> <hex-va>" to migrate that one DRAM page into LtRAM
+ * (token-gated). The placement *mechanism*; the scanning-hand policy replaces
+ * this manual trigger later.
+ */
+static ssize_t ltram_migrate_va_write(struct file *f, const char __user *buf,
+				      size_t len, loff_t *ppos)
+{
+	char kbuf[80];
+	struct mm_struct *mm;
+	unsigned long va;
+	int pid, ret;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+	if (sscanf(kbuf, "%d %lx", &pid, &va) != 2)
+		return -EINVAL;
+	va &= PAGE_MASK;
+
+	mm = ltram_get_mm(pid);
+	if (!mm)
+		return -ESRCH;
+	if (!ltram_token_try_consume()) {	/* over endurance budget */
+		mmput(mm);
+		return -EBUSY;
+	}
+	lru_add_drain_all();
+	ret = ltram_migrate_one(mm, va);
+	if (!ret)
+		pr_info_ratelimited("ltram: migrate DRAM->LtRAM va=0x%lx pid=%d (WP)\n",
+				    va, pid);
+	mmput(mm);
+	return ret ? ret : len;
+}
+
+/*
+ * debugfs: write "<pid> <hex-start> <npages>" to migrate a contiguous range
+ * into LtRAM with a SINGLE LRU drain for the whole batch (the per-page drain in
+ * migrate_va is far too slow for the 1M migrate-stress harness). Token-gated
+ * per page; stops early when the bucket is empty. Always returns len.
+ */
+static ssize_t ltram_migrate_range_write(struct file *f, const char __user *buf,
+					 size_t len, loff_t *ppos)
+{
+	char kbuf[96];
+	struct mm_struct *mm;
+	unsigned long start, npages, i, done = 0;
+	int pid;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+	if (sscanf(kbuf, "%d %lx %lu", &pid, &start, &npages) != 3)
+		return -EINVAL;
+	start &= PAGE_MASK;
+	if (npages > (1UL << 20))		/* sanity cap */
+		npages = 1UL << 20;
+
+	mm = ltram_get_mm(pid);
+	if (!mm)
+		return -ESRCH;
+	lru_add_drain_all();			/* once for the whole batch */
+	for (i = 0; i < npages; i++) {
+		if (!ltram_token_try_consume())	/* over budget: stop here */
+			break;
+		if (ltram_migrate_one(mm, start + i * PAGE_SIZE) == 0)
+			done++;
+	}
+	mmput(mm);
+	pr_info_ratelimited("ltram: migrate range pid=%d start=0x%lx n=%lu done=%lu\n",
+			    pid, start, npages, done);
+	return len;
+}
+
+static const struct file_operations ltram_migrate_va_fops = {
+	.open	= simple_open,
+	.write	= ltram_migrate_va_write,
+	.llseek	= noop_llseek,
+};
+static const struct file_operations ltram_migrate_range_fops = {
+	.open	= simple_open,
+	.write	= ltram_migrate_range_write,
+	.llseek	= noop_llseek,
+};
+
+/* ===========================================================================
+ * The scanning hand: autonomous DRAM->LtRAM placement policy.
+ *
+ * A single kthread sweeps a target process's private writable ANON pages as a
+ * CLOCK. On each visit it ages the page by clearing the hardware dirty bit; a
+ * page found still clean on a later visit went a full lap without a write =
+ * write-cold, and is migrated to LtRAM (endurance-token-gated, then write-
+ * protected so a future write repatriates it). Anon-only keeps dirty-bit
+ * clearing safe (no writeback; no swap in this model). THP is skipped (v1).
+ * Inert until a pid is written to /sys/kernel/debug/ltram/scan_pid.
+ * ===========================================================================
+ */
+struct ltram_scan_ctx {
+	unsigned long cand[64];			/* write-cold VAs to migrate   */
+	int ncand, maxc;
+	unsigned long scanned, batch, aged, stop_addr;
+};
+
+/* Age a present pte: clear the dirty bit so a future write re-sets it. The
+ * caller holds the pte lock; the TLB is flushed once per sweep (see below). */
+static void ltram_pte_age(struct vm_area_struct *vma, unsigned long addr,
+			  pte_t *ptep)
+{
+	pte_t old = ptep_modify_prot_start(vma, addr, ptep);
+
+	ptep_modify_prot_commit(vma, addr, ptep, old, pte_mkclean(old));
+}
+
+static bool ltram_scan_vma_ok(struct vm_area_struct *vma)
+{
+	if (!vma || !(vma->vm_flags & VM_WRITE))		/* RO already routed */
+		return false;
+	if (vma->vm_flags & (VM_SHARED | VM_MAYSHARE))		/* shared excluded   */
+		return false;
+	if (vma->vm_flags & VM_GROWSDOWN)			/* stack             */
+		return false;
+	if (vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP))
+		return false;
+	return true;
+}
+
+static int ltram_scan_test(unsigned long start, unsigned long end,
+			   struct mm_walk *walk)
+{
+	return ltram_scan_vma_ok(walk->vma) ? 0 : 1;	/* 1 => skip this VMA */
+}
+
+static int ltram_scan_pmd(pmd_t *pmd, unsigned long addr, unsigned long next,
+			  struct mm_walk *walk)
+{
+	if (pmd_trans_huge(*pmd))			/* v1: base pages only */
+		walk->action = ACTION_CONTINUE;
+	return 0;
+}
+
+static int ltram_scan_pte(pte_t *pte, unsigned long addr, unsigned long next,
+			  struct mm_walk *walk)
+{
+	struct ltram_scan_ctx *c = walk->private;
+	pte_t p = ptep_get(pte);
+	struct page *pg;
+
+	if (pte_present(p)) {
+		pg = vm_normal_page(walk->vma, addr, p);
+		if (pg && PageAnon(pg)) {
+			if (pte_dirty(p)) {
+				ltram_pte_age(walk->vma, addr, pte);	/* written */
+				c->aged++;
+			} else if (page_zonenum(pg) != ZONE_LTRAM &&
+				   c->ncand < c->maxc) {
+				c->cand[c->ncand++] = addr;		/* cold    */
+			}
+		}
+	}
+	if (++c->scanned >= c->batch || c->ncand >= c->maxc) {
+		c->stop_addr = addr + PAGE_SIZE;
+		return 1;					/* end this sweep */
+	}
+	return 0;
+}
+
+static const struct mm_walk_ops ltram_scan_ops = {
+	.test_walk = ltram_scan_test,
+	.pmd_entry = ltram_scan_pmd,
+	.pte_entry = ltram_scan_pte,
+};
+
+static int ltram_scan_thread(void *unused)
+{
+	while (!kthread_should_stop()) {
+		int pid = READ_ONCE(ltram_scan_pid);
+		struct mm_struct *mm;
+		struct ltram_scan_ctx c;
+		int i, ret;
+
+		if (pid <= 0) {
+			msleep_interruptible(ltram_scan_interval_ms);
+			continue;
+		}
+		mm = ltram_get_mm(pid);
+		if (!mm) {				/* target exited: stop */
+			WRITE_ONCE(ltram_scan_pid, 0);
+			continue;
+		}
+
+		memset(&c, 0, sizeof(c));
+		c.batch = ltram_scan_batch ? ltram_scan_batch : 4096;
+		c.maxc  = min_t(int, ltram_scan_max_migrate,
+				(int)ARRAY_SIZE(c.cand));
+
+		/* Pass 1: age written pages, collect write-cold candidates. */
+		lru_add_drain_all();
+		mmap_read_lock(mm);
+		ret = walk_page_range(mm, ltram_scan_cursor, TASK_SIZE,
+				      &ltram_scan_ops, &c);
+		if (c.aged)
+			flush_tlb_mm(mm);		/* one flush per sweep */
+		mmap_read_unlock(mm);
+		/* ret==1 => stopped at the batch limit; else swept to the end. */
+		ltram_scan_cursor = (ret == 1) ? c.stop_addr : 0;
+
+		/* Pass 2: migrate candidates with locks dropped, endurance-gated.
+		 * Each ltram_migrate_one re-checks eligibility and write-protects. */
+		for (i = 0; i < c.ncand; i++) {
+			if (!ltram_token_try_consume())
+				break;
+			ltram_migrate_one(mm, c.cand[i]);
+		}
+		mmput(mm);
+
+		ltram_scan_passes++;
+		ltram_scan_last_cand = c.ncand;
+		ltram_scan_total_migrated += i;
+
+		msleep_interruptible(ltram_scan_interval_ms);
+	}
+	return 0;
+}
+
+/* debugfs: write a pid to start scanning it; 0 or -1 to stop. */
+static ssize_t ltram_scan_pid_write(struct file *f, const char __user *buf,
+				    size_t len, loff_t *ppos)
+{
+	char kbuf[32];
+	int pid;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+	if (kstrtoint(strim(kbuf), 10, &pid))
+		return -EINVAL;
+	ltram_scan_cursor = 0;
+	WRITE_ONCE(ltram_scan_pid, pid);
+	pr_info("ltram: scan target pid=%d (interval=%ums batch=%u maxmig=%u)\n",
+		pid, ltram_scan_interval_ms, ltram_scan_batch,
+		ltram_scan_max_migrate);
+	return len;
+}
+static int ltram_scan_pid_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", READ_ONCE(ltram_scan_pid));
+	return 0;
+}
+static int ltram_scan_pid_open(struct inode *i, struct file *f)
+{
+	return single_open(f, ltram_scan_pid_show, NULL);
+}
+static const struct file_operations ltram_scan_pid_fops = {
+	.open	 = ltram_scan_pid_open,
+	.read	 = seq_read,
+	.write	 = ltram_scan_pid_write,
+	.llseek	 = seq_lseek,
+	.release = single_release,
+};
+
 /* Allocate wear-tracking state, expose debugfs, and turn accounting on. */
 static void ltram_accounting_init(struct zone *zone)
 {
@@ -339,6 +788,13 @@ static void ltram_accounting_init(struct zone *zone)
 	ltram_zone	= zone;
 	ltram_base_pfn	= zone->zone_start_pfn;
 	ltram_nr_frames	= zone->spanned_pages;
+
+	/* Start the endurance token bucket full so bring-up has budget. */
+	ltram_token_last_ns = ktime_get_ns();
+	ltram_tokens_milli  = (u64)ltram_token_cap * 1000ULL;
+	pr_info("LTRAM: endurance token bucket = %u programs/s (cap %u)%s\n",
+		ltram_token_rate, ltram_token_cap,
+		ltram_token_rate ? "" : "  [DISABLED: unlimited]");
 
 	ltram_erase_count  = vzalloc(array_size(ltram_nr_frames, sizeof(u32)));
 	ltram_frame_origin = vzalloc(ltram_nr_frames);
@@ -357,6 +813,17 @@ static void ltram_accounting_init(struct zone *zone)
 	debugfs_create_file("erase_histogram", 0444, dir, NULL,
 			    &ltram_erase_histogram_fops);
 	debugfs_create_file("reset", 0200, dir, NULL, &ltram_reset_fops);
+	debugfs_create_file("migrate_va", 0200, dir, NULL, &ltram_migrate_va_fops);
+	debugfs_create_file("migrate_range", 0200, dir, NULL, &ltram_migrate_range_fops);
+	debugfs_create_file("scan_pid", 0644, dir, NULL, &ltram_scan_pid_fops);
+
+	/* Start the scanning hand (idle until a pid is written to scan_pid). */
+	ltram_scan_task = kthread_run(ltram_scan_thread, NULL, "ltram_scan");
+	if (IS_ERR(ltram_scan_task)) {
+		pr_warn("LTRAM: scan kthread failed to start (%ld); policy disabled\n",
+			PTR_ERR(ltram_scan_task));
+		ltram_scan_task = NULL;
+	}
 
 	static_branch_enable(&ltram_accounting_enabled);
 
@@ -423,11 +890,20 @@ int ltram_migrate_to(struct folio *folio)
 	unsigned long nr = folio_nr_pages(folio);
 	int err;
 
-	if (!folio_isolate_lru(folio))
+	/*
+	 * Contract (mirrors migrate_misplaced_folio): the caller holds an
+	 * elevated reference on @folio; this function consumes it. On success
+	 * the isolation reference keeps the folio alive through migration; on
+	 * any failure we drop the caller's reference before returning.
+	 */
+	if (!folio_isolate_lru(folio)) {
+		folio_put(folio);
 		return -EBUSY;
+	}
 
 	node_stat_mod_folio(folio, NR_ISOLATED_ANON + folio_is_file_lru(folio),
-			    folio_nr_pages(folio));
+			    nr);
+	folio_put(folio);		/* isolation took its own ref */
 	list_add_tail(&folio->lru, &list);
 
 	/* Mark the migration context so the destination allocation is attributed
