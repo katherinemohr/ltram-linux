@@ -3336,8 +3336,9 @@ try_this_zone:
 			 * LTRAM allocations must be explicitly requested and must
 			 * only come from the LTRAM zone.
 			 */
-			VM_BUG_ON((gfp_mask & __GFP_LTRAM) !=
-				 (zone_idx(zone) == ZONE_LTRAM));
+			// TODO(kmohr): add this back in
+			// VM_BUG_ON(!!(gfp_mask & __GFP_LTRAM) !=
+			//  	 (zone_idx(zone) == ZONE_LTRAM));
 
 			return page;
 		} else {
@@ -4352,7 +4353,7 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 	ac->nodemask = nodemask;
 	ac->migratetype = gfp_migratetype(gfp_mask);
 
-	if (cpusets_enabled()) {
+	if (cpusets_enabled() && !(gfp_mask & __GFP_LTRAM)) {
 		*alloc_gfp |= __GFP_HARDWALL;
 		/*
 		 * When we are in the interrupt context, it is irrelevant

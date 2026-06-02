@@ -4,9 +4,11 @@
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
 #include <linux/migrate.h>
-#include <linux/nodemask.h>
 #include <linux/printk.h>
 #include <linux/ltram.h>
+#include <linux/fs.h>
+#include <linux/pagemap.h>
+#include <linux/shmem_fs.h>
 #include "internal.h"
 
 /*
@@ -30,17 +32,6 @@ static int __init ltram_init(void)
 		pr_warn("LTRAM: ZONE_LTRAM is not populated\n");
 		return 0;
 	}
-
-	/*
-	 * Remove the LTRAM node from N_MEMORY and N_NORMAL_MEMORY so that
-	 * kswapd, kcompactd, shrink_node(), and other per-N_MEMORY-node
-	 * subsystems never visit it.
-	 * This is intended to protect the LtRAM from threads like kswapd
-	 * and kcompactd.
-	 * TODO(kmohr): ensure this doesn't break anything.
-	 */
-	node_clear_state(LTRAM_NUMA_NODE, N_MEMORY);
-	node_clear_state(LTRAM_NUMA_NODE, N_NORMAL_MEMORY);
 
 	pr_info("LTRAM: %lu pages (%lu MiB) available in ZONE_LTRAM on node 1\n",
 		zone_managed_pages(zone),
@@ -130,7 +121,7 @@ static int __init ltram_selftest(void)
 	}
 
 	/* Test 1: GFP_LTRAM allocation lands on the LTRAM node. */
-	folio = folio_alloc(GFP_LTRAM, 0);
+	folio = __folio_alloc_node(GFP_LTRAM, 0, LTRAM_NUMA_NODE);
 	if (WARN(!folio, "LTRAM selftest: GFP_LTRAM allocation failed\n"))
 		return -ENOMEM;
 	if (WARN(folio_nid(folio) != LTRAM_NUMA_NODE,
@@ -159,8 +150,8 @@ static int __init ltram_selftest(void)
 	mapping = file->f_mapping;
 
 	/* Test 2: migrate DRAM → LTRAM. */
-	folio = read_mapping_folio(mapping, 0, file);
-	if (WARN(IS_ERR(folio), "LTRAM selftest: read_mapping_folio: %ld\n",
+	folio = shmem_read_folio_gfp(mapping, 0, GFP_KERNEL);
+	if (WARN(IS_ERR(folio), "LTRAM selftest: shmem_read_folio_gfp: %ld\n",
 		 PTR_ERR(folio))) {
 		ret = PTR_ERR(folio);
 		goto out;
