@@ -1540,7 +1540,7 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	page_table_check_alloc(page, order);
 
 	/* LtRAM wear/placement accounting; nop unless LtRAM is present (static key). */
-	ltram_note_alloc(page, order); 
+	ltram_note_alloc(page, order);
 }
 
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
@@ -4365,7 +4365,7 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 	ac->nodemask = nodemask;
 	ac->migratetype = gfp_migratetype(gfp_mask);
 
-	if (cpusets_enabled()) {
+	if (cpusets_enabled() && !(gfp_mask & __GFP_LTRAM)) {
 		*alloc_gfp |= __GFP_HARDWALL;
 		/*
 		 * When we are in the interrupt context, it is irrelevant
