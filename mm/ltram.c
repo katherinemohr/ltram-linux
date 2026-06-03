@@ -789,9 +789,9 @@ static void ltram_accounting_init(struct zone *zone)
 	ltram_base_pfn	= zone->zone_start_pfn;
 	ltram_nr_frames	= zone->spanned_pages;
 
-	/* Start the endurance token bucket full so bring-up has budget. */
+	/* Start the endurance token bucket EMPTY; tokens accrue at the endurance rate. */
 	ltram_token_last_ns = ktime_get_ns();
-	ltram_tokens_milli  = (u64)ltram_token_cap * 1000ULL;
+	ltram_tokens_milli  = 0;  /* start empty: tokens are earned at the endurance rate */
 	pr_info("LTRAM: endurance token bucket = %u programs/s (cap %u)%s\n",
 		ltram_token_rate, ltram_token_cap,
 		ltram_token_rate ? "" : "  [DISABLED: unlimited]");
