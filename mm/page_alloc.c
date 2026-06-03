@@ -56,7 +56,6 @@
 #include <linux/cacheinfo.h>
 #include <asm/div64.h>
 #include "internal.h"
-#include "shuffle.h"
 #include "page_reporting.h"
 
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
