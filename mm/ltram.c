@@ -26,6 +26,7 @@
 #include <linux/delay.h>
 #include <linux/pagewalk.h>
 #include <linux/uaccess.h>
+#include <linux/fs.h>
 #include <linux/pagemap.h>
 #include <linux/shmem_fs.h>
 #include "internal.h"
