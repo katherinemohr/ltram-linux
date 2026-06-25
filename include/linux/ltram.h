@@ -4,6 +4,7 @@
 
 #include <linux/jump_label.h>
 
+#define DRAM_NUMA_NODE 0
 #define LTRAM_NUMA_NODE 1
 
 /* Per-frame state, packed into ltram_frame_origin[]: bit0 = origin of the
