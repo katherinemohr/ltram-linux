@@ -8,7 +8,6 @@
 
 #include <linux/kernel.h>
 #include <linux/slab.h>
-#include <linux/ltram.h>
 #include <linux/init.h>
 #include <linux/bitops.h>
 #include <linux/poison.h>
@@ -1459,10 +1458,12 @@ phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
 	 * Functionally equivalent to a no-LtRAM kernel for the common case
 	 * because LtRAM is the highest-PFN node and the default search is
 	 * top-down. The retry loop below may still fall back to any node
-	 * (including LtRAM) if node 0 cannot satisfy the request; the
-	 * existing WARN catches that rare case.
+	 * (including LtRAM) only if node 0 cannot satisfy the request, which
+	 * does not happen at boot for our sizing.
+	 *
+	 * TODO(kmohr): brittle, but works for our assumed NODE 0 = DRAM,
+	 * NODE 1 = LTRAM topology.
 	 */
-	/* TODO(kmohr): this is brittle but works for our assumed NODE 0 = DRAM, NODE 1 = LTRAM case */
 	if (nid == NUMA_NO_NODE)
 		nid = 0;
 
@@ -1496,17 +1497,6 @@ again:
 	return 0;
 
 done:
-	/*
-	 * Warn if this allocation landed on the LTRAM node.
-	 */
-	{
-		unsigned long _start_pfn, _end_pfn;
-		WARN(memblock_search_pfn_nid(PFN_DOWN(found),
-					     &_start_pfn, &_end_pfn) == LTRAM_NUMA_NODE,
-		     "memblock: unexpected allocation on LTRAM node %d at PFN %llu\n",
-		     LTRAM_NUMA_NODE, (unsigned long long)PFN_DOWN(found));
-	}
-
 	/*
 	 * Skip kmemleak for those places like kasan_init() and
 	 * early_pgtable_alloc() due to high volume.

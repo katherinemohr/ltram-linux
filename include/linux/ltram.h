@@ -17,7 +17,6 @@ struct folio;
 struct page;
 
 int ltram_migrate_to(struct folio *folio);
-int ltram_migrate_from(struct folio *folio);
 
 /* Endurance rate limiter for DRAM->LtRAM placement: spend one token per
  * migration; false => over budget this instant, skip. */

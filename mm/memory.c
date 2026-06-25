@@ -2948,43 +2948,37 @@ static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
 		gfp = GFP_KERNEL;
 
 	/*
-	 * LtRAM auto-routing: send allocations for read-only VMAs to
-	 * ZONE_LTRAM. Catches text segments, read-only file mmaps, vDSO,
-	 * and read-only anonymous mappings. If the VMA is later mprotect()'d
-	 * writable, the resulting write fault repatriates the page to DRAM via
-	 * copy-on-write in do_wp_page() (see ltram_note_repatriated()).
+	 * LtRAM auto-routing: send read-only, private, FILE-backed fault
+	 * allocations (program text, read-only file mmaps) to ZONE_LTRAM. If the
+	 * VMA is later mprotect()'d writable, the resulting write fault
+	 * repatriates the page to DRAM via copy-on-write in do_wp_page() (see
+	 * ltram_note_repatriated()).
 	 *
-	 * Skip categories where the allocator does not own pages normally:
-	 *  - VM_HUGETLB: huge-page semantics
-	 *  - VM_IO / VM_PFNMAP: device memory
-	 *  - VM_MIXEDMAP: special mappings
+	 * File-backed only: a read-only anonymous fault resolves to the shared
+	 * zero page and never allocates, so routing anon here would be a silent
+	 * no-op. Cold anonymous pages are placed in LtRAM by the scanning hand
+	 * instead. Also skipped: shared mappings (VM_SHARED|VM_MAYSHARE) -- COW
+	 * repatriation cannot preserve shared-write semantics -- and categories
+	 * the allocator does not own normally (VM_HUGETLB, VM_IO, VM_PFNMAP,
+	 * VM_MIXEDMAP).
 	 *
-	 * Also skip SHARED mappings (VM_SHARED | VM_MAYSHARE): COW repatriation
-	 * cannot preserve shared-write semantics, so a shared LtRAM page would be
-	 * written in place (a flash write).
-	 *
-	 * File-backed safety gate: a file page lives in the shared inode page
-	 * cache, so COW repatriation (which only fires for private faults) does
-	 * NOT protect it -- a write() syscall or another task's writable mapping
-	 * would dirty the LtRAM folio in place. Until those write paths
-	 * repatriate explicitly (TODO: intercept the buffered-write / page_mkwrite
-	 * paths via ltram_migrate_from()), only route a file page whose backing
-	 * file handle is read-only (no FMODE_WRITE). Anonymous pages are private
-	 * and COW-protected, so they stay eligible without this gate.
-	 *
-	 * NOTE: the FMODE_WRITE check is per-open-file, so it does not yet stop a
-	 * *second* task that opens the same inode O_RDWR and write()s it; closing
-	 * that fully needs the deferred write-path repatriation above. For an
-	 * airtight gate, swap the FMODE_WRITE test for
+	 * Safety gate (FMODE_WRITE): a file page lives in the shared inode page
+	 * cache, so COW repatriation (private faults only) does NOT protect it --
+	 * a write() syscall or another task's writable mapping would dirty the
+	 * LtRAM folio in place. Until those write paths repatriate explicitly
+	 * (TODO: intercept the buffered-write / page_mkwrite paths and migrate
+	 * the folio back to DRAM), only route a file whose backing handle is
+	 * read-only. This is per-open-file, so it does not yet stop a *second*
+	 * task that opens the same inode O_RDWR and write()s it; for an airtight
+	 * gate, swap FMODE_WRITE for
 	 * (IS_RDONLY(file_inode(vm_file)) || IS_IMMUTABLE(file_inode(vm_file))).
 	 */
-	if (!(vma->vm_flags & VM_WRITE) &&
+	if (vm_file && !(vm_file->f_mode & FMODE_WRITE) &&
+	    !(vma->vm_flags & VM_WRITE) &&
 	    (vma->vm_flags & VM_READ) &&
 	    !(vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) &&
-	    !(vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP)) &&
-	    (!vm_file || !(vm_file->f_mode & FMODE_WRITE))) {
+	    !(vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP)))
 		gfp |= __GFP_LTRAM;
-	}
 
 	return gfp;
 }
@@ -4845,7 +4839,6 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
 
 	ret |= finish_fault(vmf);
 	folio = page_folio(vmf->page);
-
 	folio_unlock(folio);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		folio_put(folio);
