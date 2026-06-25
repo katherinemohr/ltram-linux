@@ -47,16 +47,26 @@ static u8  *ltram_frame_origin;		/* LTRAM_ORIGIN_* of current occupant */
 static unsigned long ltram_base_pfn;
 static unsigned long ltram_nr_frames;
 
-/* Erase-block size (in 4KB frames) for the block-level histogram. NOR erases
- * per block; default 16 frames = 64 KiB. Tunable via ltram.block_frames=. */
-static unsigned int ltram_block_frames = 16;
-module_param_named(block_frames, ltram_block_frames, uint, 0644);
-
 /* Global tallies; per-cpu to avoid cache-line bouncing, summed on read. */
+
+/* Total frame program/erase operations on LtRAM (one per page programmed in;
+ * += 1<<order in __ltram_note_alloc). Device-wide wear count. */
 static DEFINE_PER_CPU(unsigned long, ltram_total_programs);
+
+/* Pages moved DRAM->LtRAM by the placement policy (scan/migrate_va/range);
+ * += nr on a successful ltram_migrate_to(). */
 static DEFINE_PER_CPU(unsigned long, ltram_migrated_in);
+
+/* Pages repatriated LtRAM->DRAM whose origin was LTRAM_ORIGIN_ALLOC (placed at
+ * allocation time by read-only fault routing). Should stay ~0: a read-only
+ * placement that got written and pulled back. */
 static DEFINE_PER_CPU(unsigned long, ltram_migrated_back_of_alloc);
+
+/* Pages repatriated LtRAM->DRAM whose origin was LTRAM_ORIGIN_MIGRATED (moved in
+ * by the scanner). The migration-policy quality signal: scanner-placed pages
+ * that turned out to be written and had to come back. */
 static DEFINE_PER_CPU(unsigned long, ltram_migrated_back_of_migrated);
+
 /* Distinct placed pages that took a write fault, split by placement origin.
  * alloc should stay ~0 (read-only routing is write-cold by construction);
  * migrated is the placement-policy quality signal. */
@@ -81,14 +91,37 @@ static unsigned long ltram_scan_total_migrated;	/* migrated by the scan        *
 static unsigned long ltram_scan_last_cand;	/* candidates found last wake  */
 
 /* ---- endurance token bucket (DRAM->LtRAM placement rate limiter) ---------
- * NOR endurance 10^5 cycles, 5-year life, 65536 frames:
- *   65536 * 1e5 / (5*365.25*86400) ~= 42 programs/s sustained.
+ * The sustainable device-wide program rate is the total program budget spread
+ * over the target lifetime:
+ *   rate = (frames * endurance_cycles) / lifetime_seconds
+ * Computed at compile time from the constants below (round-to-nearest) so it
+ * tracks the modeled NOR endurance and LtRAM size instead of being a magic
+ * number. With the defaults (256 MiB = 65536 frames, 1e5 cycles, 5
+ * years) this works out to ~42/s.
  * Each placement migration spends one token. Time-based refill; tokens kept in
  * milli-units so sub-second refill works at low rates. token_rate=0 disables
  * the limit (bring-up). Valid as a device-wide budget only WITH wear-leveling
- * (else the hottest frame's 10^5 limit binds first -- see
- * docs/wear_leveling_allocator.md). */
-static unsigned int ltram_token_rate = 42;	/* tokens/sec */
+ * (else the hottest frame's endurance limit binds first -- see
+ * docs/wear_leveling_allocator.md).
+ *
+ * LTRAM_ASSUMED_SIZE_MB is a compile-time stand-in: the real zone size is a
+ * boot-time property (ltram_nr_frames). If you boot a different LtRAM size,
+ * scale token_rate= to match (or recompute from ltram_nr_frames in
+ * ltram_init()). ULL keeps frames*cycles (6.5e9) from overflowing 32-bit.
+ */
+#define LTRAM_ENDURANCE_CYCLES	100000ULL	/* NOR program/erase cycles/frame */
+#define LTRAM_TARGET_LIFE_YEARS	5ULL
+#define LTRAM_SECS_PER_YEAR	31557600ULL	/* 365.25 d * 86400 s */
+#define LTRAM_FRAME_BYTES	4096ULL
+#define LTRAM_ASSUMED_SIZE_MB	256ULL		/* default node-1 LtRAM size      */
+#define LTRAM_ASSUMED_FRAMES \
+	(LTRAM_ASSUMED_SIZE_MB * 1024ULL * 1024ULL / LTRAM_FRAME_BYTES)
+#define LTRAM_TARGET_LIFE_SECS	(LTRAM_TARGET_LIFE_YEARS * LTRAM_SECS_PER_YEAR)
+#define LTRAM_TOKEN_RATE_DEFAULT \
+	((LTRAM_ASSUMED_FRAMES * LTRAM_ENDURANCE_CYCLES + LTRAM_TARGET_LIFE_SECS / 2) \
+	 / LTRAM_TARGET_LIFE_SECS)
+
+static unsigned int ltram_token_rate = LTRAM_TOKEN_RATE_DEFAULT;  /* tokens/sec */
 static unsigned int ltram_token_cap  = 512;	/* burst cap  */
 module_param_named(token_rate, ltram_token_rate, uint, 0644);
 module_param_named(token_cap,  ltram_token_cap,  uint, 0644);
@@ -190,19 +223,33 @@ static u8 ltram_folio_origin(struct folio *folio)
 }
 
 /*
- * An LtRAM folio is being copied back to DRAM by wp_page_copy() (write-fault
- * repatriation). Count it against migrated_back, split by placement origin, so
- * the stats show how many LtRAM pages had to be pulled back because they were
- * written. read_only_permille_migrated quantifies migration-policy quality.
+ * Account a folio leaving LtRAM for DRAM, split by placement origin. Single
+ * chokepoint for both repatriation paths -- write-fault COW (wp_page_copy, via
+ * the export) and the explicit ltram_migrate_from() -- so the origin split and
+ * the warning can't drift between call sites. An alloc-origin page coming back
+ * means a page we placed in LtRAM as read-only got written and pulled back;
+ * read-only routing is meant to be write-cold, so migrated_back_of_alloc should
+ * stay ~0 -- warn (ratelimited) so a run surfaces it.
+ *
+ * @folio is the *source* (LtRAM) folio. Its struct page and PFN are address-
+ * stable and the page stays in ZONE_LTRAM regardless of refcount, so callers may
+ * invoke this after a successful migrate_pages() has moved the contents to DRAM
+ * (ltram_migrate_from does); the origin byte read here is the LtRAM frame we
+ * came from.
  */
 void ltram_note_repatriated(struct folio *folio)
 {
+	unsigned long nr = folio_nr_pages(folio);
+
 	if (!ltram_frame_origin)
 		return;
-	if (ltram_folio_origin(folio) == LTRAM_ORIGIN_MIGRATED)
-		this_cpu_inc(ltram_migrated_back_of_migrated);
-	else
-		this_cpu_inc(ltram_migrated_back_of_alloc);
+	if (ltram_folio_origin(folio) == LTRAM_ORIGIN_MIGRATED) {
+		this_cpu_add(ltram_migrated_back_of_migrated, nr);
+	} else {
+		// pr_warn_ratelimited("ltram: read-only-placed page repatriated pfn=0x%lx nr=%lu\n",
+		// 		    folio_pfn(folio), nr);
+		this_cpu_add(ltram_migrated_back_of_alloc, nr);
+	}
 }
 
 /*
@@ -338,26 +385,31 @@ static int ltram_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "scan_migrated              %lu\n", ltram_scan_total_migrated);
 	seq_printf(m, "scan_last_candidates       %lu\n", ltram_scan_last_cand);
 	seq_puts(m, "# erase_count models NOR program cycles per 4KB frame\n");
-	seq_puts(m, "# tokens: endurance budget for DRAM->LtRAM placement (~42/s)\n");
+	seq_puts(m, "# tokens: endurance budget for DRAM->LtRAM placement (see token_rate_per_s)\n");
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ltram_stats);
 
-/* Log2-bucketed distribution of per-frame counts, then per erase-block. */
-static void ltram_emit_hist(struct seq_file *m, unsigned long (*get)(unsigned long),
-			    unsigned long count, const char *unit)
+/*
+ * Log2-bucketed distribution of per-4KB-frame program/erase counts. The modeled
+ * NOR erases per 4KB frame (see the LtRAM specs in README.md), so the frame IS
+ * the erase block -- no separate per-block aggregation is needed.
+ */
+static int ltram_erase_histogram_show(struct seq_file *m, void *v)
 {
 	unsigned long buckets[33] = {0};
 	unsigned long i;
 	int b;
 
-	for (i = 0; i < count; i++) {
-		u32 c = get(i);
+	for (i = 0; i < ltram_nr_frames; i++) {
+		u32 c = ltram_erase_count[i];
 
 		b = c ? min_t(int, 1 + ilog2(c), 32) : 0;
 		buckets[b]++;
 	}
-	seq_printf(m, "  %-9s %-18s %s\n", "bucket", "erase-count range", unit);
+
+	seq_puts(m, "# per-4KB-frame program/erase-count distribution\n");
+	seq_printf(m, "  %-9s %-18s %s\n", "bucket", "erase-count range", "frames");
 	seq_printf(m, "  %-9d %-18s %lu\n", 0, "0", buckets[0]);
 	for (b = 1; b <= 32; b++) {
 		unsigned long lo, hi;
@@ -375,36 +427,6 @@ static void ltram_emit_hist(struct seq_file *m, unsigned long (*get)(unsigned lo
 			seq_printf(m, "  %-9d %-18s %lu\n", b, r, buckets[b]);
 		}
 	}
-}
-
-static unsigned long ltram_frame_get(unsigned long i)
-{
-	return ltram_erase_count[i];
-}
-
-static unsigned long ltram_block_get(unsigned long blk)
-{
-	unsigned long start = blk * ltram_block_frames;
-	unsigned long end = min(start + ltram_block_frames, ltram_nr_frames);
-	unsigned long i, sum = 0;
-
-	for (i = start; i < end; i++)
-		sum += ltram_erase_count[i];
-	return sum;
-}
-
-static int ltram_erase_histogram_show(struct seq_file *m, void *v)
-{
-	unsigned long nblocks;
-
-	seq_puts(m, "# per-4KB-frame program/erase-count distribution\n");
-	ltram_emit_hist(m, ltram_frame_get, ltram_nr_frames, "frames");
-
-	nblocks = ltram_block_frames ?
-		DIV_ROUND_UP(ltram_nr_frames, ltram_block_frames) : 0;
-	seq_printf(m, "\n# per-erase-block (%u frames = %u KiB) summed distribution\n",
-		   ltram_block_frames, ltram_block_frames * 4);
-	ltram_emit_hist(m, ltram_block_get, nblocks, "blocks");
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ltram_erase_histogram);
@@ -439,8 +461,10 @@ static const struct file_operations ltram_reset_fops = {
 /*
  * Write-protect the PTE mapping @va in @mm so the next write faults into
  * do_wp_page() -> COW repatriation. Single-PTE: correct for private,
- * single-mapped pages (the placement target). A page mapped in several
- * processes (COW after fork) would need an rmap walk to cover every PTE; TODO.
+ * single-mapped pages (the placement target), which ltram_migrate_one()
+ * enforces by skipping folios with folio_mapcount() != 1. Covering folios
+ * mapped in several processes (COW after fork) would need an rmap walk; until
+ * then those folios are simply not migrated in.
  */
 static void ltram_wrprotect_va(struct mm_struct *mm, unsigned long va)
 {
@@ -493,6 +517,19 @@ static int ltram_migrate_one(struct mm_struct *mm, unsigned long va)
 	if (folio_zonenum(folio) == ZONE_LTRAM) {		/* already there */
 		folio_put(folio);
 		return 0;
+	}
+	/*
+	 * Only migrate single-mapped folios. Repatriation relies on
+	 * ltram_wrprotect_va() write-protecting the mapping so a later write
+	 * faults into do_wp_page(); it fixes only the one (mm, va) we hold here.
+	 * A folio mapped at more than one PTE -- COW-shared after fork, or a
+	 * multiply-mapped large folio -- would keep a writable alias that could
+	 * write the LtRAM page in place, bypassing repatriation. Skip those
+	 * until an rmap-wide write-protect exists.
+	 */
+	if (folio_mapcount(folio) != 1) {
+		folio_put(folio);
+		return -EBUSY;
 	}
 	ret = ltram_migrate_to(folio);				/* consumes the ref */
 	if (!ret)
@@ -907,7 +944,17 @@ int ltram_migrate_to(struct folio *folio)
 	list_add_tail(&folio->lru, &list);
 
 	/* Mark the migration context so the destination allocation is attributed
-	 * as migrated-in (see __ltram_note_alloc via post_alloc_hook). */
+	 * as migrated-in (see __ltram_note_alloc via post_alloc_hook).
+	 *
+	 * TODO(kmohr): this stamp is load-bearing on migrate_pages() allocating
+	 * the destination synchronously in THIS task, inside the active=1 window
+	 * (alloc_migration_target runs as the get_new_folio callback, before the
+	 * copy). If that ever changes -- deferred/async destination allocation, or
+	 * a new path that migrates into LtRAM without setting this flag -- pages
+	 * would silently mislabel as LTRAM_ORIGIN_ALLOC. It is also a single bit,
+	 * not save/restore, so re-entrant ltram_migrate_to() would clear it early.
+	 * Affects placement-origin stats only, not correctness. Harden by
+	 * save/restoring the flag, or thread origin through migration_target_control. */
 	current->ltram_migrate_active = 1;
 	err = migrate_pages(&list, alloc_migration_target, NULL,
 			    (unsigned long)&mtc, MIGRATE_SYNC, MR_SYSCALL, NULL);
@@ -937,8 +984,6 @@ int ltram_migrate_from(struct folio *folio)
 		.nid      = 0,  /* DRAM node */
 		.gfp_mask = GFP_HIGHUSER_MOVABLE | __GFP_THISNODE,
 	};
-	unsigned long nr = folio_nr_pages(folio);
-	u8 origin = ltram_folio_origin(folio);	/* read before the page moves */
 	int err;
 
 	if (!folio_isolate_lru(folio))
@@ -952,9 +997,7 @@ int ltram_migrate_from(struct folio *folio)
 			    (unsigned long)&mtc, MIGRATE_SYNC, MR_SYSCALL, NULL);
 	if (err)
 		putback_movable_pages(&list);
-	else if (origin == LTRAM_ORIGIN_MIGRATED)
-		this_cpu_add(ltram_migrated_back_of_migrated, nr);
 	else
-		this_cpu_add(ltram_migrated_back_of_alloc, nr);
+		ltram_note_repatriated(folio);
 	return err ? -EFAULT : 0;
 }

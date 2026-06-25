@@ -2933,8 +2933,7 @@ pte_unlock:
 	return ret;
 }
 
-static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma,
-				  unsigned long address)
+static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
 {
 	struct file *vm_file = vma->vm_file;
 	gfp_t gfp;
@@ -2962,21 +2961,29 @@ static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma,
 	 *
 	 * Also skip SHARED mappings (VM_SHARED | VM_MAYSHARE): COW repatriation
 	 * cannot preserve shared-write semantics, so a shared LtRAM page would be
-	 * written in place (a flash write). Excluding them keeps every LtRAM page
-	 * private, so the COW repatriation path is always correct.
-	 * TODO: handle shared pages instead via ltram_migrate_from() (migrate_pages,
-	 * rewrites all rmap entries) and compare against this exclude policy.
+	 * written in place (a flash write).
+	 *
+	 * File-backed safety gate: a file page lives in the shared inode page
+	 * cache, so COW repatriation (which only fires for private faults) does
+	 * NOT protect it -- a write() syscall or another task's writable mapping
+	 * would dirty the LtRAM folio in place. Until those write paths
+	 * repatriate explicitly (TODO: intercept the buffered-write / page_mkwrite
+	 * paths via ltram_migrate_from()), only route a file page whose backing
+	 * file handle is read-only (no FMODE_WRITE). Anonymous pages are private
+	 * and COW-protected, so they stay eligible without this gate.
+	 *
+	 * NOTE: the FMODE_WRITE check is per-open-file, so it does not yet stop a
+	 * *second* task that opens the same inode O_RDWR and write()s it; closing
+	 * that fully needs the deferred write-path repatriation above. For an
+	 * airtight gate, swap the FMODE_WRITE test for
+	 * (IS_RDONLY(file_inode(vm_file)) || IS_IMMUTABLE(file_inode(vm_file))).
 	 */
 	if (!(vma->vm_flags & VM_WRITE) &&
 	    (vma->vm_flags & VM_READ) &&
 	    !(vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) &&
-	    !(vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP))) {
-		gfp |= __GFP_LTRAM | __GFP_THISNODE;
-		/* Visible (ratelimited) so a run shows read-only pages routed in. */
-		pr_info_ratelimited("ltram: route->LtRAM va=0x%lx file=%s\n",
-			 address,
-			 vm_file ? vm_file->f_path.dentry->d_name.name
-				 : (const unsigned char *)"(anon)");
+	    !(vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP)) &&
+	    (!vm_file || !(vm_file->f_mode & FMODE_WRITE))) {
+		gfp |= __GFP_LTRAM;
 	}
 
 	return gfp;
@@ -3531,21 +3538,15 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	 * is repatriated to DRAM and the write retries on the DRAM copy.
 	 *
 	 * File-backed LtRAM pages already reach wp_page_copy (not anon); the
-	 * reuse-in-place path below is reachable only for anonymous exclusive
-	 * pages, which is why we must skip it for LtRAM. (Shared mappings do not
-	 * carry __GFP_LTRAM, so shared LtRAM pages do not occur in practice.)
+	 * reuse-in-place path below is reachable for anonymous pages. We force
+	 * the copy for the non-exclusive reuse case, but NOT for
+	 * PageAnonExclusive pages -- see the GUP-vs-COW note at that branch.
+	 * (Shared mappings do not carry __GFP_LTRAM, so shared LtRAM pages do
+	 * not occur in practice.)
 	 */
 	wp_ltram = folio && folio_zonenum(folio) == ZONE_LTRAM;
-	if (wp_ltram) {
-		struct file *vm_file = vma->vm_file;
-
+	if (wp_ltram)
 		ltram_note_write_fault(folio);	/* count the write-fault event */
-		/* Visible (ratelimited) so a run shows pages bouncing LtRAM->DRAM. */
-		pr_info_ratelimited("ltram: repatriate LtRAM->DRAM va=0x%lx pfn=0x%lx file=%s\n",
-			vmf->address, folio_pfn(folio),
-			vm_file ? vm_file->f_path.dentry->d_name.name
-				: (const unsigned char *)"(anon)");
-	}
 
 	/*
 	 * Shared mapping: we are guaranteed to have VM_WRITE and
@@ -3568,11 +3569,23 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	 * Private mapping: create an exclusive anonymous page copy if reuse
 	 * is impossible. We might miss VM_WRITE for FOLL_FORCE handling.
 	 *
-	 * If we encounter a page that is marked exclusive, we must reuse
-	 * the page without further checks.
+	 * If we encounter a page that is marked exclusive, we must reuse it
+	 * in place without further checks. This is the GUP-vs-COW invariant: a
+	 * PageAnonExclusive page may be long-term pinned (O_DIRECT/DMA), and
+	 * copying it would leave the pin attached to the stale page while the
+	 * process sees the copy -- silent data divergence. That rule overrides
+	 * LtRAM repatriation, so we must NOT force a copy for exclusive pages
+	 * even when they live in ZONE_LTRAM. (Such a page is then written in
+	 * place on flash; correctness wins over the no-flash-write policy, and
+	 * an exclusive+pinned LtRAM page is rare -- it can only arise if the
+	 * scanning hand migrated the page in before the pin was taken.)
+	 *
+	 * We only force the repatriating copy for the non-exclusive reuse
+	 * case (wp_can_reuse_anon_folio), where there is no pin to break.
 	 */
-	if (!wp_ltram && folio && folio_test_anon(folio) &&
-	    (PageAnonExclusive(vmf->page) || wp_can_reuse_anon_folio(folio, vma))) {
+	if (folio && folio_test_anon(folio) &&
+	    (PageAnonExclusive(vmf->page) ||
+	     (!wp_ltram && wp_can_reuse_anon_folio(folio, vma)))) {
 		if (!PageAnonExclusive(vmf->page))
 			SetPageAnonExclusive(vmf->page);
 		if (unlikely(unshare)) {
@@ -4833,26 +4846,6 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
 	ret |= finish_fault(vmf);
 	folio = page_folio(vmf->page);
 
-	/*
-	 * LtRAM debug: log the resolved outcome of read-only file-backed
-	 * faults so we can see where the page actually landed.
-	 */
-	{
-		struct vm_area_struct *_vma = vmf->vma;
-		if (!(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)) &&
-		    !(_vma->vm_flags & VM_WRITE) &&
-		    (_vma->vm_flags & VM_READ) &&
-		    !(_vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP))) {
-			pr_debug("ltram: resolved va=0x%lx pa=0x%llx nid=%d zone=%d file=%s\n",
-				 vmf->address,
-				 (u64)page_to_phys(vmf->page),
-				 page_to_nid(vmf->page),
-				 page_zonenum(vmf->page),
-				 _vma->vm_file ? _vma->vm_file->f_path.dentry->d_name.name
-					       : (const unsigned char *)"(anon)");
-		}
-	}
-
 	folio_unlock(folio);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		folio_put(folio);
@@ -5312,7 +5305,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 		.real_address = address,
 		.flags = flags,
 		.pgoff = linear_page_index(vma, address),
-		.gfp_mask = __get_fault_gfp_mask(vma, address & PAGE_MASK),
+		.gfp_mask = __get_fault_gfp_mask(vma),
 	};
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long vm_flags = vma->vm_flags;

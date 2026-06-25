@@ -5856,6 +5856,19 @@ static void setup_per_zone_lowmem_reserve(void)
 			for (j = i + 1; j < MAX_NR_ZONES; j++) {
 				struct zone *upper_zone = &pgdat->node_zones[j];
 
+				/*
+				 * LtRAM is only reachable via an explicit __GFP_LTRAM
+				 * request (forced onto node 1's ZONE_LTRAM-only
+				 * zonelist) and is never a fallback target for a lower
+				 * zone, so its pages must not inflate any lower zone's
+				 * reserve. Mirror the ZONE_LTRAM exclusion that
+				 * __setup_per_zone_wmarks() already applies.
+				 */
+				if (j == ZONE_LTRAM) {
+					zone->lowmem_reserve[j] = 0;
+					continue;
+				}
+
 				managed_pages += zone_managed_pages(upper_zone);
 
 				if (clear)

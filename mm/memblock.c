@@ -1462,6 +1462,7 @@ phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
 	 * (including LtRAM) if node 0 cannot satisfy the request; the
 	 * existing WARN catches that rare case.
 	 */
+	/* TODO(kmohr): this is brittle but works for our assumed NODE 0 = DRAM, NODE 1 = LTRAM case */
 	if (nid == NUMA_NO_NODE)
 		nid = 0;
 
