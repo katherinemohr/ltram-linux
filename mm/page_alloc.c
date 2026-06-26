@@ -5851,12 +5851,16 @@ static void setup_per_zone_lowmem_reserve(void)
 				struct zone *upper_zone = &pgdat->node_zones[j];
 
 				/*
-				 * LtRAM is only reachable via an explicit __GFP_LTRAM
-				 * request (forced onto node 1's ZONE_LTRAM-only
-				 * zonelist) and is never a fallback target for a lower
-				 * zone, so its pages must not inflate any lower zone's
-				 * reserve. Mirror the ZONE_LTRAM exclusion that
-				 * __setup_per_zone_wmarks() already applies.
+				 * ZONE_LTRAM is the highest zone and is only entered
+				 * via an explicit __GFP_LTRAM request. A lower zone's
+				 * lowmem_reserve[ZONE_LTRAM] is consulted only when a
+				 * __GFP_LTRAM allocation overflows down into that zone
+				 * (node 1's fallback zonelist spills into node 0).
+				 * Leaving it at the default would (a) fold LtRAM's whole
+				 * size into the zone's reserve and thus into
+				 * totalreserve_pages, and (b) throttle that legitimate
+				 * overflow-to-DRAM path. Zero it on both counts. Mirrors
+				 * the ZONE_LTRAM exclusion in __setup_per_zone_wmarks().
 				 */
 				if (j == ZONE_LTRAM) {
 					zone->lowmem_reserve[j] = 0;
