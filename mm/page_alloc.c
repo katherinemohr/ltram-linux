@@ -4353,8 +4353,9 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 	/* gfp_zone() already maps __GFP_LTRAM to ZONE_LTRAM; only the zonelist
 	 * differs -- LtRAM allocations are forced onto node 1's list. */
 	ac->highest_zoneidx = gfp_zone(gfp_mask);
-	ac->zonelist = node_zonelist(
-		(gfp_mask & __GFP_LTRAM) ? LTRAM_NUMA_NODE : preferred_nid, gfp_mask);
+	ac->zonelist = node_zonelist((gfp_mask & __GFP_LTRAM) ? LTRAM_NUMA_NODE
+								: preferred_nid,
+				     gfp_mask);
 	ac->nodemask = nodemask;
 	ac->migratetype = gfp_migratetype(gfp_mask);
 
@@ -5848,6 +5849,19 @@ static void setup_per_zone_lowmem_reserve(void)
 
 			for (j = i + 1; j < MAX_NR_ZONES; j++) {
 				struct zone *upper_zone = &pgdat->node_zones[j];
+
+				/*
+				 * LtRAM is only reachable via an explicit __GFP_LTRAM
+				 * request (forced onto node 1's ZONE_LTRAM-only
+				 * zonelist) and is never a fallback target for a lower
+				 * zone, so its pages must not inflate any lower zone's
+				 * reserve. Mirror the ZONE_LTRAM exclusion that
+				 * __setup_per_zone_wmarks() already applies.
+				 */
+				if (j == ZONE_LTRAM) {
+					zone->lowmem_reserve[j] = 0;
+					continue;
+				}
 
 				managed_pages += zone_managed_pages(upper_zone);
 
