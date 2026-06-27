@@ -88,9 +88,24 @@ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
  * GFP_ZONES_SHIFT must be <= 2 on 32 bit platforms.
  */
 
-#if defined(CONFIG_ZONE_DEVICE) && (MAX_NR_ZONES-2) <= 4
-/* ZONE_DEVICE is not a valid GFP zone specifier */
-/* xxx(kmohr): I'm also going to make ZONE_LTRAM not part of this table. */
+/*
+ * Neither ZONE_DEVICE (no GFP flag) nor ZONE_LTRAM is encoded in
+ * GFP_ZONE_TABLE: ZONE_DEVICE is not a valid GFP zone specifier, and ZONE_LTRAM
+ * is selected by gfp_zone()'s __GFP_LTRAM early return (below), not the table.
+ * ZONE_LTRAM is always present; ZONE_DEVICE only when configured. The table
+ * only has to encode the remaining zones (the highest of which is ZONE_MOVABLE),
+ * which fit in 2 bits while that count stays <= 4. Subtract the non-table zones
+ * so the 2-bit packing is selected on every config -- in particular on
+ * !CONFIG_ZONE_DEVICE and 32-bit builds, where ZONES_SHIFT would otherwise be 3
+ * and overflow GFP_ZONE_TABLE (16 * 3 = 48 > 32 == BITS_PER_LONG).
+ */
+#if defined(CONFIG_ZONE_DEVICE)
+#define GFP_NR_NONTABLE_ZONES 2		/* ZONE_DEVICE + ZONE_LTRAM */
+#else
+#define GFP_NR_NONTABLE_ZONES 1		/* ZONE_LTRAM */
+#endif
+
+#if (MAX_NR_ZONES - GFP_NR_NONTABLE_ZONES) <= 4
 #define GFP_ZONES_SHIFT 2
 #else
 #define GFP_ZONES_SHIFT ZONES_SHIFT
@@ -131,19 +146,16 @@ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
 static inline enum zone_type gfp_zone(gfp_t flags)
 {
 	enum zone_type z;
+	int bit;
 
-	/* Handle LTRAM outside the zone table since we don't have enough space
-	 * in the zone table for another flag.
-	 * Math: GFP_ZONE_TABLE = # rows * 3 bits per row
-	 * # rows = 2 ^ (zone flags minus 1 for the DEVICE flag)
-	 * (2^4) * 3 = 48 < 64, but (2^5) * 3 = 96 > 64
+	/*
+	 * ZONE_LTRAM has no slot in GFP_ZONE_TABLE (see GFP_NR_NONTABLE_ZONES
+	 * above), so route __GFP_LTRAM here before the table lookup.
 	 */
-	if (unlikely(flags & __GFP_LTRAM)) {
+	if (unlikely(flags & __GFP_LTRAM))
 		return ZONE_LTRAM;
-	}
 
-	int bit = (__force int) (flags & GFP_ZONEMASK);
-
+	bit = (__force int) (flags & GFP_ZONEMASK);
 	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
 					 ((1 << GFP_ZONES_SHIFT) - 1);
 	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);

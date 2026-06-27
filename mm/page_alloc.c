@@ -1179,6 +1179,9 @@ static __always_inline bool free_pages_prepare(struct page *page,
 
 	debug_pagealloc_unmap_pages(page, 1 << order);
 
+	/* LtRAM accounting: a page leaving the allocator (frees mirror allocs). */
+	ltram_note_free(page, order);
+
 	return true;
 }
 
@@ -1535,6 +1538,9 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 
 	set_page_owner(page, order, gfp_flags);
 	page_table_check_alloc(page, order);
+
+	/* LtRAM wear/placement accounting; nop unless LtRAM is present (static key). */
+	ltram_note_alloc(page, order);
 }
 
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
@@ -3333,12 +3339,14 @@ try_this_zone:
 				reserve_highatomic_pageblock(page, zone);
 
 			/*
-			 * LTRAM allocations must be explicitly requested and must
-			 * only come from the LTRAM zone.
+			 * The reverse invariant (no non-__GFP_LTRAM caller ever
+			 * receives a ZONE_LTRAM page) is already enforced by the
+			 * WARN_ONCE + continue at the top of this loop. We do NOT
+			 * assert the converse: a __GFP_LTRAM request is allowed to
+			 * fall back to DRAM when ZONE_LTRAM is full (node 1's
+			 * fallback zonelist includes node 0), since routing is an
+			 * optimization and a read-only page in DRAM is still correct.
 			 */
-			VM_BUG_ON((gfp_mask & __GFP_LTRAM) !=
-				 (zone_idx(zone) == ZONE_LTRAM));
-
 			return page;
 		} else {
 			if (has_unaccepted_memory()) {
@@ -4342,13 +4350,12 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 		struct alloc_context *ac, gfp_t *alloc_gfp,
 		unsigned int *alloc_flags)
 {
-	if (gfp_mask & __GFP_LTRAM) {
-		ac->highest_zoneidx = ZONE_LTRAM;
-		ac->zonelist = node_zonelist(LTRAM_NUMA_NODE, gfp_mask);
-	} else {
-		ac->highest_zoneidx = gfp_zone(gfp_mask);
-		ac->zonelist = node_zonelist(preferred_nid, gfp_mask);
-	}
+	/* gfp_zone() already maps __GFP_LTRAM to ZONE_LTRAM; only the zonelist
+	 * differs -- LtRAM allocations are forced onto node 1's list. */
+	ac->highest_zoneidx = gfp_zone(gfp_mask);
+	ac->zonelist = node_zonelist((gfp_mask & __GFP_LTRAM) ? LTRAM_NUMA_NODE
+								: preferred_nid,
+				     gfp_mask);
 	ac->nodemask = nodemask;
 	ac->migratetype = gfp_migratetype(gfp_mask);
 
@@ -5842,6 +5849,23 @@ static void setup_per_zone_lowmem_reserve(void)
 
 			for (j = i + 1; j < MAX_NR_ZONES; j++) {
 				struct zone *upper_zone = &pgdat->node_zones[j];
+
+				/*
+				 * ZONE_LTRAM is the highest zone and is only entered
+				 * via an explicit __GFP_LTRAM request. A lower zone's
+				 * lowmem_reserve[ZONE_LTRAM] is consulted only when a
+				 * __GFP_LTRAM allocation overflows down into that zone
+				 * (node 1's fallback zonelist spills into node 0).
+				 * Leaving it at the default would (a) fold LtRAM's whole
+				 * size into the zone's reserve and thus into
+				 * totalreserve_pages, and (b) throttle that legitimate
+				 * overflow-to-DRAM path. Zero it on both counts. Mirrors
+				 * the ZONE_LTRAM exclusion in __setup_per_zone_wmarks().
+				 */
+				if (j == ZONE_LTRAM) {
+					zone->lowmem_reserve[j] = 0;
+					continue;
+				}
 
 				managed_pages += zone_managed_pages(upper_zone);
 

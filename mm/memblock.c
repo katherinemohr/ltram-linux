@@ -1452,6 +1452,19 @@ phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
 	if (WARN_ONCE(nid == MAX_NUMNODES, "Usage of MAX_NUMNODES is deprecated. Use NUMA_NO_NODE instead\n"))
 		nid = NUMA_NO_NODE;
 
+	/*
+	 * Redirect NUMA_NO_NODE allocations away from the LtRAM node so
+	 * boot-time kernel state (per-CPU areas, swiotlb, page tables for
+	 * CPU entry areas, qspinlock hash, etc.) does not land on NOR.
+	 * Functionally equivalent to a no-LtRAM kernel for the common case
+	 * because LtRAM is the highest-PFN node and the default search is
+	 * top-down. The retry loop below may still fall back to any node
+	 * (including LtRAM) only if node 0 cannot satisfy the request, which
+	 * does not happen at boot for our sizing.
+	 */
+	if (nid == NUMA_NO_NODE)
+		nid = DRAM_NUMA_NODE;
+
 	if (!align) {
 		/* Can't use WARNs this early in boot on powerpc */
 		dump_stack();
@@ -1484,6 +1497,7 @@ again:
 done:
 	/*
 	 * Warn if this allocation landed on the LTRAM node.
+	 * This should never happen.
 	 */
 	{
 		unsigned long _start_pfn, _end_pfn;

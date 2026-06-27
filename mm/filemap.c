@@ -3100,6 +3100,16 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	unsigned long vm_flags = vmf->vma->vm_flags;
 	unsigned int mmap_miss;
 
+	/*
+	 * LtRAM routing only takes effect on the allocating fault path
+	 * (__filemap_get_folio honors vmf->gfp_mask); readahead here bulk-
+	 * allocates with mapping_gfp_mask() and would silently land routed
+	 * read-only pages in DRAM. For routed faults, skip readahead so each
+	 * page faults in individually through the routed allocation.
+	 */
+	if (vmf->gfp_mask & __GFP_LTRAM)
+		return fpin;
+
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	/* Use the readahead code, even if readahead is disabled */
 	if (vm_flags & VM_HUGEPAGE) {
@@ -3167,6 +3177,10 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
 	DEFINE_READAHEAD(ractl, file, ra, file->f_mapping, vmf->pgoff);
 	struct file *fpin = NULL;
 	unsigned int mmap_miss;
+
+	/* Routed (LtRAM) faults bypass readahead — see do_sync_mmap_readahead. */
+	if (vmf->gfp_mask & __GFP_LTRAM)
+		return fpin;
 
 	/* If we don't want any read-ahead, don't bother */
 	if (vmf->vma->vm_flags & VM_RAND_READ || !ra->ra_pages)

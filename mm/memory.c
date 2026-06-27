@@ -67,6 +67,7 @@
 #include <linux/elf.h>
 #include <linux/gfp.h>
 #include <linux/migrate.h>
+#include <linux/ltram.h>
 #include <linux/string.h>
 #include <linux/memory-tiers.h>
 #include <linux/debugfs.h>
@@ -2935,15 +2936,51 @@ pte_unlock:
 static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
 {
 	struct file *vm_file = vma->vm_file;
+	gfp_t gfp;
 
 	if (vm_file)
-		return mapping_gfp_mask(vm_file->f_mapping) | __GFP_FS | __GFP_IO;
+		gfp = mapping_gfp_mask(vm_file->f_mapping) | __GFP_FS | __GFP_IO;
+	else
+		/*
+		 * Special mappings (e.g. VDSO) do not have any file so fake
+		 * a default GFP_KERNEL for them.
+		 */
+		gfp = GFP_KERNEL;
 
 	/*
-	 * Special mappings (e.g. VDSO) do not have any file so fake
-	 * a default GFP_KERNEL for them.
+	 * LtRAM auto-routing: send read-only, private, FILE-backed fault
+	 * allocations (program text, read-only file mmaps) to ZONE_LTRAM. If the
+	 * VMA is later mprotect()'d writable, the resulting write fault
+	 * repatriates the page to DRAM via copy-on-write in do_wp_page() (see
+	 * ltram_note_repatriated()).
+	 *
+	 * File-backed only: a read-only anonymous fault resolves to the shared
+	 * zero page and never allocates, so routing anon here would be a silent
+	 * no-op. Cold anonymous pages are placed in LtRAM by the scanning hand
+	 * instead. Also skipped: shared mappings (VM_SHARED|VM_MAYSHARE) -- COW
+	 * repatriation cannot preserve shared-write semantics -- and categories
+	 * the allocator does not own normally (VM_HUGETLB, VM_IO, VM_PFNMAP,
+	 * VM_MIXEDMAP).
+	 *
+	 * Safety gate (FMODE_WRITE): a file page lives in the shared inode page
+	 * cache, so COW repatriation (private faults only) does NOT protect it --
+	 * a write() syscall or another task's writable mapping would dirty the
+	 * LtRAM folio in place. Until those write paths repatriate explicitly
+	 * (TODO: intercept the buffered-write / page_mkwrite paths and migrate
+	 * the folio back to DRAM), only route a file whose backing handle is
+	 * read-only. This is per-open-file, so it does not yet stop a *second*
+	 * task that opens the same inode O_RDWR and write()s it; for an airtight
+	 * gate, swap FMODE_WRITE for
+	 * (IS_RDONLY(file_inode(vm_file)) || IS_IMMUTABLE(file_inode(vm_file))).
 	 */
-	return GFP_KERNEL;
+	if (vm_file && !(vm_file->f_mode & FMODE_WRITE) &&
+	    !(vma->vm_flags & VM_WRITE) &&
+	    (vma->vm_flags & VM_READ) &&
+	    !(vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) &&
+	    !(vma->vm_flags & (VM_HUGETLB | VM_IO | VM_PFNMAP | VM_MIXEDMAP)))
+		gfp |= __GFP_LTRAM;
+
+	return gfp;
 }
 
 /*
@@ -3238,6 +3275,14 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 			folio_remove_rmap_pte(old_folio, vmf->page, vma);
 		}
 
+		/*
+		 * If the source page lived in LtRAM, this copy just repatriated
+		 * it to DRAM (the new page is GFP_HIGHUSER_MOVABLE). Account it
+		 * before the old_folio reference is repurposed for freeing.
+		 */
+		if (old_folio && folio_zonenum(old_folio) == ZONE_LTRAM)
+			ltram_note_repatriated(old_folio);
+
 		/* Free the old page.. */
 		new_folio = old_folio;
 		page_copied = 1;
@@ -3438,6 +3483,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	const bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio = NULL;
+	bool wp_ltram = false;
 	pte_t pte;
 
 	if (likely(!unshare)) {
@@ -3477,6 +3523,26 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 		folio = page_folio(vmf->page);
 
 	/*
+	 * LtRAM repatriation. A write fault landing on a folio in ZONE_LTRAM
+	 * means a page we routed to LtRAM (because its VMA was read-only at
+	 * fault time) is now being written. LtRAM must not be written in place,
+	 * so we force the copy-on-write path below: wp_page_copy() allocates a
+	 * fresh DRAM page (GFP_HIGHUSER_MOVABLE, never __GFP_LTRAM), copies the
+	 * contents, maps it writable, and drops the LtRAM page -- i.e. the page
+	 * is repatriated to DRAM and the write retries on the DRAM copy.
+	 *
+	 * File-backed LtRAM pages already reach wp_page_copy (not anon); the
+	 * reuse-in-place path below is reachable for anonymous pages. We force
+	 * the copy for the non-exclusive reuse case, but NOT for
+	 * PageAnonExclusive pages -- see the GUP-vs-COW note at that branch.
+	 * (Shared mappings do not carry __GFP_LTRAM, so shared LtRAM pages do
+	 * not occur in practice.)
+	 */
+	wp_ltram = folio && folio_zonenum(folio) == ZONE_LTRAM;
+	if (wp_ltram)
+		ltram_note_write_fault(folio);	/* count the write-fault event */
+
+	/*
 	 * Shared mapping: we are guaranteed to have VM_WRITE and
 	 * FAULT_FLAG_WRITE set at this point.
 	 */
@@ -3497,11 +3563,23 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	 * Private mapping: create an exclusive anonymous page copy if reuse
 	 * is impossible. We might miss VM_WRITE for FOLL_FORCE handling.
 	 *
-	 * If we encounter a page that is marked exclusive, we must reuse
-	 * the page without further checks.
+	 * If we encounter a page that is marked exclusive, we must reuse it
+	 * in place without further checks. This is the GUP-vs-COW invariant: a
+	 * PageAnonExclusive page may be long-term pinned (O_DIRECT/DMA), and
+	 * copying it would leave the pin attached to the stale page while the
+	 * process sees the copy -- silent data divergence. That rule overrides
+	 * LtRAM repatriation, so we must NOT force a copy for exclusive pages
+	 * even when they live in ZONE_LTRAM. (Such a page is then written in
+	 * place on flash; correctness wins over the no-flash-write policy, and
+	 * an exclusive+pinned LtRAM page is rare -- it can only arise if the
+	 * scanning hand migrated the page in before the pin was taken.)
+	 *
+	 * We only force the repatriating copy for the non-exclusive reuse
+	 * case (wp_can_reuse_anon_folio), where there is no pin to break.
 	 */
 	if (folio && folio_test_anon(folio) &&
-	    (PageAnonExclusive(vmf->page) || wp_can_reuse_anon_folio(folio, vma))) {
+	    (PageAnonExclusive(vmf->page) ||
+	     (!wp_ltram && wp_can_reuse_anon_folio(folio, vma)))) {
 		if (!PageAnonExclusive(vmf->page))
 			SetPageAnonExclusive(vmf->page);
 		if (unlikely(unshare)) {
