@@ -28,12 +28,8 @@
 #include <linux/pagewalk.h>
 #include <linux/uaccess.h>
 #include <linux/compaction.h>
+#include <linux/compiler.h>
 #include "internal.h"
-
-/*
- * TODO(kmohr): This needs more exhaustive reviewing, but I'll leave it for now
- * so this branch can get merged in and not block other work from progressing.
- */
 
 /* ==================== LtRAM runtime instrumentation ====================== */
 
@@ -185,7 +181,7 @@ void __ltram_note_alloc(struct page *page, unsigned int order)
 	unsigned long pfn;
 	u8 origin;
 
-	if (page_zonenum(page) != ZONE_LTRAM)
+	if (likely(page_zonenum(page) != ZONE_LTRAM))
 		return;
 
 	origin = current->ltram_migrate_active ? LTRAM_ORIGIN_MIGRATED
@@ -208,7 +204,7 @@ void __ltram_note_alloc(struct page *page, unsigned int order)
  * reached from free_pages_prepare() only when accounting is enabled. */
 void __ltram_note_free(struct page *page, unsigned int order)
 {
-	if (page_zonenum(page) != ZONE_LTRAM)
+	if (likely(page_zonenum(page) != ZONE_LTRAM))
 		return;
 	this_cpu_add(ltram_freed, 1u << order);
 }
